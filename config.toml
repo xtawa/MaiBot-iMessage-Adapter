@@ -1,0 +1,12 @@
+[plugin]
+enabled = false
+config_version = "1.0.0"
+
+[photon]
+project_id = ""
+project_secret = ""
+
+[bridge]
+ws_port = 18763
+max_retries = 3
+retry_interval = 3.0

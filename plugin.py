@@ -14,64 +14,15 @@ import secrets
 from pathlib import Path
 from typing import Any
 
-from maibot_sdk import Command, Field, MaiBotPlugin, MessageGateway, PluginConfigBase
+from maibot_sdk import Command, MaiBotPlugin, MessageGateway
 from maibot_sdk.types import MessageGatewayRouteType
 
-# ---------------------------------------------------------------------------
-# 配置模型
-# ---------------------------------------------------------------------------
+from .config import IMessageAdapterConfig
 
 
-class PhotonConfig(PluginConfigBase):
-    """Photon Spectrum 云端配置"""
-
-    __ui_label__ = "Photon 云端"
-    __ui_icon__ = "cloud"
-    __ui_order__ = 0
-
-    project_id: str = Field(
-        default="",
-        description="Photon 项目 ID",
-        json_schema_extra={"placeholder": "在 app.photon.codes 获取"},
-    )
-    project_secret: str = Field(
-        default="",
-        description="Photon 项目密钥",
-        json_schema_extra={"placeholder": "sk_xxx"},
-    )
-
-
-class BridgeConfig(PluginConfigBase):
-    """本地桥接配置"""
-
-    __ui_label__ = "本地桥接"
-    __ui_icon__ = "link"
-    __ui_order__ = 1
-
-    ws_port: int = Field(
-        default=18763,
-        description="Python 侧 WebSocket Server 监听端口（127.0.0.1）",
-    )
-    max_retries: int = Field(
-        default=3,
-        description="侧车崩溃最大重启次数",
-    )
-    retry_interval: float = Field(
-        default=3.0,
-        description="重启间隔（秒）",
-    )
-
-
-class IMessageAdapterConfig(PluginConfigBase):
-    """iMessage 适配器插件配置"""
-
-    photon: PhotonConfig = Field(default_factory=PhotonConfig)
-    bridge: BridgeConfig = Field(default_factory=BridgeConfig)
-
-
-# ---------------------------------------------------------------------------
+# —————————————————————————————————————————————————————————————————————————————
 # 插件主类
-# ---------------------------------------------------------------------------
+# —————————————————————————————————————————————————————————————————————————————
 
 
 class IMessageAdapterPlugin(MaiBotPlugin):
@@ -96,6 +47,11 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         """插件加载：启动侧车 + WebSocket Server。"""
 
         self.ctx.logger.info("iMessage 适配器正在加载…")
+
+        # 检查是否启用
+        if not self.config.plugin.should_connect():
+            self.ctx.logger.info("插件未启用，跳过加载")
+            return
 
         # 生成一次性认证 token
         self._bridge_token = secrets.token_hex(32)
@@ -146,6 +102,10 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         """插件卸载：关闭侧车 + WebSocket Server。"""
 
         self.ctx.logger.info("iMessage 适配器正在卸载…")
+
+        # 未启用时无需清理
+        if not self.config.plugin.should_connect():
+            return
 
         # 1. 取消监控和接收任务
         if self._monitor_task is not None:
@@ -439,12 +399,22 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
     @staticmethod
     def _to_mai_message_dict(data: dict) -> dict:
-        """将侧车的简化 JSON 转换为 MaiBot 标准消息字典。"""
+        """将侧车的简化 JSON 转换为 MaiBot 标准消息字典。
 
+        chat_id 直接作为 MaiBot 的 session_id，
+        保证同一个 iMessage 对话始终映射到同一个会话。
+
+        raw_message 必须是一个 list（MessageSequence 的反序列化格式），
+        字段名 "data" 对齐 SDK 的 _component_from_dict 解析规则。
+        """
         sender = data.get("sender", {})
+        chat_id = str(data.get("chat_id", ""))
+        text = str(data.get("text", ""))
+
         return {
             "message_id": data.get("message_id", ""),
             "platform": "imessage",
+            "session_id": chat_id,
             "message_info": {
                 "user_info": {
                     "user_id": str(sender.get("address", "unknown")),
@@ -452,7 +422,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                 },
                 "additional_config": {},
             },
-            "raw_message": str(data.get("text", "")),
+            "raw_message": [{"type": "text", "data": text}],
         }
 
     # ── @MessageGateway 组件 ──
@@ -475,10 +445,14 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
         del route, metadata, kwargs
 
-        raw_text = str(message.get("raw_message", "") or "")
-        stream_id = str(message.get("stream_id", "") or "")
+        # Host 传出的消息字典来自 SessionMessage._session_message_to_dict()
+        # - raw_message 是 MessageSequence 序列化后的嵌套 dict，不是纯文本
+        # - processed_plain_text 才是 LLM 处理后待发送的纯文本
+        # - session_id 是路由目标（对应 iMessage 的 chat_id）
+        raw_text = str(message.get("processed_plain_text", "") or "")
+        session_id = str(message.get("session_id", "") or "")
 
-        if not raw_text or not stream_id:
+        if not raw_text or not session_id:
             return {"success": False, "error": "缺少消息内容或目标"}
 
         if self._bridge_ws is None or not self._gateway_ready:
@@ -488,7 +462,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             payload = {
                 "type": "send",
                 "data": {
-                    "chat_id": stream_id,
+                    "chat_id": session_id,
                     "text": raw_text,
                     "attachments": [],
                 },
