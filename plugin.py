@@ -12,12 +12,15 @@ import json
 import os
 import secrets
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
-from maibot_sdk import Command, MaiBotPlugin, MessageGateway, PluginConfigBase
+from maibot_sdk import Command, MaiBotPlugin, MessageGateway
 from maibot_sdk.types import MessageGatewayRouteType
 
 from .config import IMessageAdapterConfig
+
+if TYPE_CHECKING:
+    from maibot_sdk import PluginConfigBase
 
 
 class IMessageAdapterPlugin(MaiBotPlugin):
@@ -40,10 +43,12 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         """在插件加载时根据配置决定是否启动连接。"""
+
         await self._restart_connection_if_needed()
 
     async def on_unload(self) -> None:
         """在插件卸载时关闭连接。"""
+
         await self._stop_connection()
 
         # 关闭 WebSocket Server
@@ -64,6 +69,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             config_data: 最新的配置数据。
             version: 配置版本号。
         """
+
         if scope != "self":
             return
 
@@ -268,8 +274,78 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
     # ── 进程管理 ──
 
+    async def _ensure_sidecar_built(self, sidecar_dir: Path) -> bool:
+        """确保侧车已编译，必要时自动执行 npm install + npm run build。
+
+        Returns:
+            bool: 编译产物是否存在且可运行。
+        """
+
+        dist_file = sidecar_dir / "dist" / "index.js"
+        if dist_file.exists():
+            return True
+
+        node_modules = sidecar_dir / "node_modules"
+        if not node_modules.exists():
+            self.ctx.logger.info("侧车依赖尚未安装，正在执行 npm install…")
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    "npm",
+                    "install",
+                    cwd=str(sidecar_dir),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await asyncio.wait_for(process.communicate(), timeout=120.0)
+                if process.returncode != 0:
+                    self.ctx.logger.error(
+                        "npm install 失败: %s",
+                        (stderr or b"").decode("utf-8", errors="replace")[:500],
+                    )
+                    return False
+            except asyncio.TimeoutError:
+                self.ctx.logger.error("npm install 超时")
+                return False
+            except Exception as exc:
+                self.ctx.logger.error("npm install 异常: %s", exc)
+                return False
+
+        self.ctx.logger.info("正在编译侧车 TypeScript…")
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "npx",
+                "tsc",
+                cwd=str(sidecar_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(process.communicate(), timeout=60.0)
+            if process.returncode != 0:
+                self.ctx.logger.error(
+                    "tsc 编译失败: %s",
+                    (stderr or b"").decode("utf-8", errors="replace")[:500],
+                )
+                return False
+        except asyncio.TimeoutError:
+            self.ctx.logger.error("tsc 编译超时")
+            return False
+        except Exception as exc:
+            self.ctx.logger.error("tsc 编译异常: %s", exc)
+            return False
+
+        if not dist_file.exists():
+            self.ctx.logger.error("tsc 编译完成后仍未找到 dist/index.js")
+            return False
+
+        self.ctx.logger.info("侧车编译完成")
+        return True
+
     async def _launch_sidecar(self, sidecar_dir: Path, ws_port: int) -> None:
         """启动 Node.js 侧车子进程。"""
+
+        if not await self._ensure_sidecar_built(sidecar_dir):
+            self.ctx.logger.error("侧车编译失败，无法启动")
+            return
         env = {
             **os.environ,
             "BRIDGE_WS_PORT": str(ws_port),

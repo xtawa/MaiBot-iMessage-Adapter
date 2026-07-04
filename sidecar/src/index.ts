@@ -11,7 +11,7 @@
  *   3. 把 SDK 的 Message/Space 翻译成简化 JSON
  */
 
-import { Spectrum } from "spectrum-ts";
+import { Spectrum, text } from "spectrum-ts";
 import { imessage } from "spectrum-ts/providers/imessage";
 import { WebSocket } from "ws";
 
@@ -175,16 +175,9 @@ pyWs.on("message", async (raw) => {
   if (msg.type === "send") {
     // 调 SDK 的发送 API：发送纯文本
     try {
-      // 需要根据 chat_id 找到对应的 space
-      // 注意: spectrum-ts 的 space.send() 是发送到当前循环中的 space
-      // 对于出站场景，需要通过 app 查找或使用当前已知的 space
-      // 第一版简化处理：如果 chat_id 匹配当前 space，直接发送
       if (currentSpace && currentSpace.id === msg.data.chat_id) {
-        const { text } = await import("spectrum-ts");
         await currentSpace.send(text(msg.data.text));
       } else {
-        // 跨 space 发送 — spectrum-ts 支持通过 app 获取 space
-        // 第一版暂不支持；记录错误
         console.warn("[sidecar] 跨 space 发送暂不支持: chat_id=", msg.data.chat_id);
       }
     } catch (err) {

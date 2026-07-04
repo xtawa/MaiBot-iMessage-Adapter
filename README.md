@@ -23,19 +23,13 @@ MaiBot (plugin.py)  ←─本地 WebSocket─→  Node.js 侧车  ←─spectrum
 
 ## 安装
 
-1. 将插件目录放入 MaiBot 的 `plugins/` 下：
+将插件目录放入 MaiBot 的 `plugins/` 下即可。
 
-   ```
-   plugins/iMessage-Adapter/
-   ```
+```
+plugins/iMessage-Adapter/
+```
 
-2. 安装侧车依赖：
-
-   ```bash
-   cd plugins/iMessage-Adapter/sidecar
-   npm install
-   npm run build
-   ```
+首次启用时，插件会自动执行 `npm install` 安装侧车依赖并编译 TypeScript（约 150 个包，可能需要 1-2 分钟）。后续启动将跳过此步骤。
 
 ## 配置
 
@@ -71,7 +65,7 @@ MaiBot (plugin.py)  ←─本地 WebSocket─→  Node.js 侧车  ←─spectrum
 
 | 症状 | 可能原因 | 解决 |
 |------|----------|------|
-| `/imessage_status` 显示未连接 | 侧车未启动或未安装依赖 | 确认 `sidecar/node_modules/` 存在，执行 `npm install && npm run build` |
+| `/imessage_status` 显示未连接 | 侧车未安装依赖或编译失败 | 插件会自动执行 `npm install && tsc`，查看日志确认是否成功 |
 | Photon 认证失败 | project_id/project_secret 配置错误 | 在 WebUI 插件配置页面检查凭证是否正确 |
 | 侧车反复重启 | 网络问题或 Photon 服务异常 | 查看 MaiBot 日志中的 `[侧车]` 前缀消息 |
 | 能收不能发 | 网关未就绪 | 等待 Photon 完全连接后重试，或用 `/imessage_status` 确认状态 |

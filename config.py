@@ -93,12 +93,12 @@ class PhotonServerConfig(PluginConfigBase):
                 label_ja="プロジェクト ID",
                 hint_en="Obtain from the Photon dashboard (app.photon.codes) after creating a project.",
                 hint_ja="Photon ダッシュボード (app.photon.codes) でプロジェクト作成後に取得します。",
-                placeholder_en="proj_xxxxxxxx",
-                placeholder_ja="proj_xxxxxxxx",
+                placeholder_en="PROJECT_ID",
+                placeholder_ja="PROJECT_ID",
             ),
             "label": "项目 ID",
             "order": 0,
-            "placeholder": "proj_xxxxxxxx",
+            "placeholder": "PROJECT_ID",
         },
     )
     project_secret: str = Field(
@@ -111,13 +111,13 @@ class PhotonServerConfig(PluginConfigBase):
                 label_ja="プロジェクトシークレット",
                 hint_en="The secret paired with the project ID. Keep it safe and never expose it.",
                 hint_ja="プロジェクト ID とペアになるシークレットです。安全に保管し、決して公開しないでください。",
-                placeholder_en="sk_xxxxxxxx",
-                placeholder_ja="sk_xxxxxxxx",
+                placeholder_en="PROJECT_SECRET",
+                placeholder_ja="PROJECT_SECRET",
             ),
             "input_type": "password",
             "label": "项目密钥",
             "order": 1,
-            "placeholder": "sk_xxxxxxxx",
+            "placeholder": "PROJECT_SECRET",
         },
     )
 
