@@ -23,7 +23,13 @@
     "min_version": "1.0.0",
     "max_version": "2.99.99"
   },
-  "dependencies": [],
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "nodeenv",
+      "version_spec": ">=1.10.0"
+    }
+  ],
   "plugin_type": "adapter",
   "display": {
     "icon": {

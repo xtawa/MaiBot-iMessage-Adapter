@@ -16,8 +16,8 @@ MaiBot (plugin.py)  ←─本地 WebSocket─→  Node.js 侧车  ←─spectrum
 
 | 依赖 | 最低版本 | 用途 |
 |------|----------|------|
-| Node.js | ≥ 18 | 侧车运行时 |
-| npm | ≥ 9 | 侧车依赖管理 |
+| nodeenv (PyPI) | ≥ 1.10.0 | 系统无 Node.js 时自动安装（由 MaiBot 依赖流水线自动管理） |
+| Node.js | ≥ 18 | 侧车运行时。插件优先使用系统安装的 Node.js；若未找到，会自动通过 nodeenv 安装到插件目录下的 `.nodeenv/` |
 | Photon 账号 | — | iMessage 云端服务，在 [app.photon.codes](https://app.photon.codes) 注册 |
 | MaiBot | ≥ 1.0.0 | 插件宿主 |
 
@@ -29,7 +29,7 @@ MaiBot (plugin.py)  ←─本地 WebSocket─→  Node.js 侧车  ←─spectrum
 plugins/iMessage-Adapter/
 ```
 
-首次启用时，插件会自动执行 `npm install` 安装侧车依赖并编译 TypeScript（约 150 个包，可能需要 1-2 分钟）。后续启动将跳过此步骤。
+首次启用时，插件会在插件目录下通过 `nodeenv` 自动提供 Node.js 运行时（若系统已有则跳过），然后自动执行 `npm install` 安装侧车依赖并编译 TypeScript（约 150 个包，可能需要 1-2 分钟）。后续启动将跳过此步骤。
 
 ## 配置
 

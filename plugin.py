@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import secrets
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -21,6 +22,14 @@ from .config import IMessageAdapterConfig
 
 if TYPE_CHECKING:
     from maibot_sdk import PluginConfigBase
+
+
+# ── 模块常量 ──
+
+# nodeenv 安装路径（插件目录下的 .nodeenv/）
+_NODEENV_DIR = Path(__file__).parent / ".nodeenv"
+# Windows: Scripts, Linux/macOS: bin
+_NODEENV_BIN = "Scripts" if os.name == "nt" else "bin"
 
 
 class IMessageAdapterPlugin(MaiBotPlugin):
@@ -274,6 +283,77 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
     # ── 进程管理 ──
 
+    @staticmethod
+    def _node_bin_dir() -> Path:
+        """返回 .nodeenv 中 node/npm/npx 所在的 bin 目录。"""
+        return _NODEENV_DIR / _NODEENV_BIN
+
+    @staticmethod
+    def _nodeenv_node() -> Path:
+        """返回 .nodeenv 中的 node 可执行文件路径。"""
+        ext = ".exe" if os.name == "nt" else ""
+        return _NODEENV_DIR / _NODEENV_BIN / f"node{ext}"
+
+    @staticmethod
+    def _nodeenv_npm() -> Path:
+        """返回 .nodeenv 中的 npm 可执行文件路径。"""
+        ext = ".cmd" if os.name == "nt" else ""
+        return _NODEENV_DIR / _NODEENV_BIN / f"npm{ext}"
+
+    @staticmethod
+    def _nodeenv_npx() -> Path:
+        """返回 .nodeenv 中的 npx 可执行文件路径。"""
+        ext = ".cmd" if os.name == "nt" else ""
+        return _NODEENV_DIR / _NODEENV_BIN / f"npx{ext}"
+
+    async def _resolve_node_binaries(self) -> tuple[str, str, str]:
+        """解析 node、npm、npx 的可执行文件路径。
+
+        查找顺序:
+        1. 系统 PATH（零开销，最优先）
+        2. 插件目录下的 .nodeenv/ 缓存
+        3. 都不存在 → 在线程池中调用 _install_nodeenv() 安装
+
+        Returns:
+            (node_path, npm_path, npx_path) — 可执行文件路径字符串。
+        """
+
+        system_node = shutil.which("node")
+        system_npm = shutil.which("npm")
+        if system_node and system_npm:
+            npm_dir = Path(system_npm).parent
+            npx_name = "npx.cmd" if os.name == "nt" else "npx"
+            system_npx = str(npm_dir / npx_name)
+            return system_node, system_npm, system_npx
+
+        cached_node = self._nodeenv_node()
+        cached_npm = self._nodeenv_npm()
+        cached_npx = self._nodeenv_npx()
+        if cached_node.exists() and cached_npm.exists():
+            return str(cached_node), str(cached_npm), str(cached_npx)
+
+        self.ctx.logger.info("系统中未找到 Node.js，正在通过 nodeenv 安装到 %s…", _NODEENV_DIR)
+        await asyncio.to_thread(self._install_nodeenv)
+        self.ctx.logger.info("Node.js 安装完成")
+        return str(cached_node), str(cached_npm), str(cached_npx)
+
+    @staticmethod
+    def _install_nodeenv() -> None:
+        """同步安装 nodeenv 到插件目录（在线程池中执行）。"""
+        import nodeenv
+
+        nodeenv_dir = _NODEENV_DIR
+        if nodeenv_dir.exists():
+            return
+
+        args = nodeenv.make_parser().parse_args([
+            "--prebuilt",
+            "--node", "lts",
+            "--clean-src",
+            str(nodeenv_dir),
+        ])
+        nodeenv.create_environment(str(nodeenv_dir), args)
+
     async def _ensure_sidecar_built(self, sidecar_dir: Path) -> bool:
         """确保侧车已编译，必要时自动执行 npm install + npm run build。
 
@@ -285,12 +365,14 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         if dist_file.exists():
             return True
 
+        _, npm_path, npx_path = await self._resolve_node_binaries()
+
         node_modules = sidecar_dir / "node_modules"
         if not node_modules.exists():
             self.ctx.logger.info("侧车依赖尚未安装，正在执行 npm install…")
             try:
                 process = await asyncio.create_subprocess_exec(
-                    "npm",
+                    npm_path,
                     "install",
                     cwd=str(sidecar_dir),
                     stdout=asyncio.subprocess.PIPE,
@@ -313,7 +395,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         self.ctx.logger.info("正在编译侧车 TypeScript…")
         try:
             process = await asyncio.create_subprocess_exec(
-                "npx",
+                npx_path,
                 "tsc",
                 cwd=str(sidecar_dir),
                 stdout=asyncio.subprocess.PIPE,
@@ -346,6 +428,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         if not await self._ensure_sidecar_built(sidecar_dir):
             self.ctx.logger.error("侧车编译失败，无法启动")
             return
+        node_path, _, _ = await self._resolve_node_binaries()
         env = {
             **os.environ,
             "BRIDGE_WS_PORT": str(ws_port),
@@ -355,7 +438,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         }
 
         self._sidecar_process = await asyncio.create_subprocess_exec(
-            "node",
+            node_path,
             "dist/index.js",
             cwd=str(sidecar_dir),
             env=env,
