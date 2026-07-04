@@ -39,18 +39,19 @@ MaiBot (plugin.py)  ←─本地 WebSocket─→  Node.js 侧车  ←─spectrum
 
 ## 配置
 
-在 MaiBot 的 WebUI 或通过 `config.toml` 配置：
+插件配置通过 MaiBot WebUI 的插件配置页面修改。`config.toml` 由系统自动生成和管理，请勿手动编辑。
 
-```toml
-[photon]
-project_id = "your-project-id"        # 在 app.photon.codes 获取
-project_secret = "your-project-secret" # 项目密钥
+### 配置项说明
 
-[bridge]
-ws_port = 18763                       # 本地桥接端口（一般不需要改）
-max_retries = 3                       # 侧车崩溃最大重启次数
-retry_interval = 3.0                  # 重启间隔（秒）
-```
+| 配置节 | 字段 | 类型 | 默认值 | 说明 |
+|--------|------|------|--------|------|
+| `[plugin]` | `enabled` | bool | false | 是否启用适配器 |
+| `[plugin]` | `config_version` | str | 1.0.0 | 配置版本（系统自动管理） |
+| `[photon]` | `project_id` | str | "" | Photon 项目 ID |
+| `[photon]` | `project_secret` | str | "" | Photon 项目密钥 |
+| `[bridge]` | `ws_port` | int | 18763 | 本地桥接 WebSocket 端口 |
+| `[bridge]` | `max_retries` | int | 3 | 侧车崩溃最大重启次数 |
+| `[bridge]` | `retry_interval` | float | 3.0 | 重启间隔（秒） |
 
 ## 使用
 
@@ -70,11 +71,11 @@ retry_interval = 3.0                  # 重启间隔（秒）
 
 | 症状 | 可能原因 | 解决 |
 |------|----------|------|
-| `/imessage_status` 显示未连接 | 侧车未启动 | 检查 `sidecar/node_modules/` 是否存在，确保已执行 `npm install && npm run build` |
-| Photon 认证失败 | project_id/project_secret 错误 | 检查 `config.toml` 中的凭证是否正确 |
+| `/imessage_status` 显示未连接 | 侧车未启动或未安装依赖 | 确认 `sidecar/node_modules/` 存在，执行 `npm install && npm run build` |
+| Photon 认证失败 | project_id/project_secret 配置错误 | 在 WebUI 插件配置页面检查凭证是否正确 |
 | 侧车反复重启 | 网络问题或 Photon 服务异常 | 查看 MaiBot 日志中的 `[侧车]` 前缀消息 |
 | 能收不能发 | 网关未就绪 | 等待 Photon 完全连接后重试，或用 `/imessage_status` 确认状态 |
-| 端口冲突 | 18763 被其他程序占用 | 修改 `bridge.ws_port` 配置项 |
+| 端口冲突 | 18763 被其他程序占用 | 在 WebUI 中修改「桥接端口」配置 |
 
 ## 开发
 
