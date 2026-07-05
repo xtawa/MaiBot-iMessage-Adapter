@@ -119,11 +119,15 @@ let currentSpace: Awaited<ReturnType<typeof Spectrum>>["messages"] extends Async
   ? T extends [infer S, unknown] ? S : never
   : never;
 
+// 缓存已见过的 space（按 id），支持冷发送到之前会话中出现过的 chat_id
+const spaceCache = new Map<string, typeof currentSpace>();
+
 // 启动消息消费循环（异步，不阻塞事件循环）
 (async () => {
   try {
     for await (const [space, message] of app.messages) {
       currentSpace = space;
+      spaceCache.set(space.id, space);
 
       if (message.content.type === "text") {
         pyWs.send(
@@ -175,10 +179,25 @@ pyWs.on("message", async (raw) => {
   if (msg.type === "send") {
     // 调 SDK 的发送 API：发送纯文本
     try {
-      if (currentSpace && currentSpace.id === msg.data.chat_id) {
+      let targetId = msg.data.chat_id.trim();
+      // 兼容旧格式：裸号码自动补 DM 前缀
+      if (!targetId.startsWith("any;-;") && !targetId.startsWith("any;+;")) {
+        targetId = `any;-;${targetId}`;
+      }
+      if (currentSpace && currentSpace.id === targetId) {
         await currentSpace.send(text(msg.data.text));
+      } else if (spaceCache.has(targetId)) {
+        await spaceCache.get(targetId)!.send(text(msg.data.text));
       } else {
-        console.warn("[sidecar] 跨 space 发送暂不支持: chat_id=", msg.data.chat_id);
+        // 冷发送：通过 im.space.get() 获取 Space，再调用 .send()
+        console.log("[sidecar] 冷发送到: chat_id=" + targetId);
+        const im = imessage(app);
+        const space = await im.space.get(targetId);
+        if (space) {
+          await space.send(text(msg.data.text));
+        } else {
+          console.warn("[sidecar] im.space.get 返回 null，无法发送到 " + targetId);
+        }
       }
     } catch (err) {
       console.error("[sidecar] 发送消息失败:", err);

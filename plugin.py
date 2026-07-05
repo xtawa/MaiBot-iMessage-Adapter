@@ -46,7 +46,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
     _ws_connected: asyncio.Event | None = None
     _gateway_ready: bool = False
     _bridge_token: str = ""
-    _recv_task: asyncio.Task | None = None
+    _shutting_down: bool = False
 
     # ── 生命周期 ──
 
@@ -58,6 +58,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
     async def on_unload(self) -> None:
         """在插件卸载时关闭连接。"""
 
+        self._shutting_down = True
         await self._stop_connection()
 
         # 关闭 WebSocket Server
@@ -97,6 +98,8 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             self.ctx.logger.info("iMessage 适配器保持空闲状态，因为插件未启用")
             return
 
+        self._shutting_down = False
+
         # 生成一次性认证 token
         self._bridge_token = secrets.token_hex(32)
         ws_port = self.config.bridge.ws_port
@@ -131,9 +134,20 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                 "imessage",
                 ready=True,
                 platform="imessage",
-                protocol="photon",
+                metadata={"protocol": "photon"},
             )
             self.ctx.logger.info("iMessage 网关已就绪")
+
+            # 调试发送
+            try:
+                from .debug import send_debug_message
+
+                await send_debug_message(
+                    bridge_ws=self._bridge_ws,
+                    gateway_ready=self._gateway_ready,
+                )
+            except Exception as exc:
+                self.ctx.logger.warning("[debug] 调试发送异常: %s", exc)
         else:
             self.ctx.logger.warning("Photon 未在 30s 内就绪，网关标记为未就绪")
 
@@ -143,18 +157,23 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
     async def _stop_connection(self) -> None:
         """停止当前连接并清理资源。"""
-        # 取消监控和接收任务
+        # 先标记关闭中，阻止 _monitor_sidecar 再次重启
+        self._shutting_down = True
+
+        # 取消监控任务
         if self._monitor_task is not None:
             self._monitor_task.cancel()
             self._monitor_task = None
-        if self._recv_task is not None:
-            self._recv_task.cancel()
-            self._recv_task = None
 
         # 通知侧车关闭
         if self._bridge_ws is not None:
             try:
                 await self._bridge_ws.send(json.dumps({"type": "shutdown"}))
+            except Exception:
+                pass
+            # 关闭 websocket 连接，让 _recv_loop 中的 async for 自然退出
+            try:
+                await self._bridge_ws.close()
             except Exception:
                 pass
 
@@ -214,8 +233,9 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             self._ws_connected.set()
             self.ctx.logger.info("侧车认证通过")
 
-            # 启动消息接收循环
-            self._recv_task = asyncio.create_task(self._recv_loop(websocket))
+            # 直接 await 接收循环，保持 ws_handler 存活
+            # （create_task 会让 handler 立刻返回 → websockets 框架关闭连接）
+            await self._recv_loop(websocket)
 
         server = await websockets.serve(ws_handler, "127.0.0.1", port)
         return server
@@ -239,7 +259,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                         "imessage",
                         ready=True,
                         platform="imessage",
-                        protocol="photon",
+                        metadata={"protocol": "photon"},
                     )
                     self.ctx.logger.info("Photon 已就绪")
 
@@ -277,6 +297,8 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
         except websockets.exceptions.ConnectionClosed:
             self.ctx.logger.info("侧车 WebSocket 连接已关闭")
+        except Exception as exc:
+            self.ctx.logger.error("_recv_loop 异常退出: %s", exc, exc_info=True)
         finally:
             self._bridge_ws = None
             self._gateway_ready = False
@@ -346,9 +368,16 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         if nodeenv_dir.exists():
             return
 
+        # nodeenv 的 src_base_url 默认 None，仅在 CLI main() 中初始化。
+        # 直接调用 API 需手动设置，否则 get_last_lts_node_version()
+        # 会因 "None/index.json" 而失败。
+        if nodeenv.src_base_url is None:
+            nodeenv.src_base_url = "https://nodejs.org/download/release"
+
+        node_version = nodeenv.get_last_lts_node_version()
         args = nodeenv.make_parser().parse_args([
             "--prebuilt",
-            "--node", "lts",
+            "--node", node_version,
             "--clean-src",
             str(nodeenv_dir),
         ])
@@ -365,10 +394,19 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         if dist_file.exists():
             return True
 
-        _, npm_path, npx_path = await self._resolve_node_binaries()
+        node_path, npm_path, npx_path = await self._resolve_node_binaries()
+
+        # 将 node 所在目录注入 PATH，这样 npm postinstall 脚本
+        # 启动的子进程也能找到 node。
+        node_bin_dir = str(Path(node_path).parent)
+        env = os.environ.copy()
+        env["PATH"] = node_bin_dir + os.pathsep + env.get("PATH", "")
 
         node_modules = sidecar_dir / "node_modules"
-        if not node_modules.exists():
+        # 用 node_modules/.package-lock.json（npm 安装成功的标记）来判断
+        # 而非目录是否存在，避免上一次失败遗留的空壳导致跳过安装。
+        npm_installed = (node_modules / ".package-lock.json").exists()
+        if not npm_installed:
             self.ctx.logger.info("侧车依赖尚未安装，正在执行 npm install…")
             try:
                 process = await asyncio.create_subprocess_exec(
@@ -377,12 +415,16 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                     cwd=str(sidecar_dir),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    env=env,
                 )
-                _, stderr = await asyncio.wait_for(process.communicate(), timeout=120.0)
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120.0)
                 if process.returncode != 0:
+                    out_text = (stdout or b"").decode("utf-8", errors="replace")
+                    err_text = (stderr or b"").decode("utf-8", errors="replace")
+                    combined = (out_text + "\n" + err_text).strip()
                     self.ctx.logger.error(
                         "npm install 失败: %s",
-                        (stderr or b"").decode("utf-8", errors="replace")[:500],
+                        combined,
                     )
                     return False
             except asyncio.TimeoutError:
@@ -400,13 +442,15 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                 cwd=str(sidecar_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=env,
             )
-            _, stderr = await asyncio.wait_for(process.communicate(), timeout=60.0)
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60.0)
             if process.returncode != 0:
-                self.ctx.logger.error(
-                    "tsc 编译失败: %s",
-                    (stderr or b"").decode("utf-8", errors="replace")[:500],
-                )
+                # tsc 编译错误走 stdout，不是 stderr，两者都要输出
+                out_text = (stdout or b"").decode("utf-8", errors="replace")
+                err_text = (stderr or b"").decode("utf-8", errors="replace")
+                combined = (out_text + "\n" + err_text).strip()
+                self.ctx.logger.error("tsc 编译失败: %s", combined)
                 return False
         except asyncio.TimeoutError:
             self.ctx.logger.error("tsc 编译超时")
@@ -530,6 +574,9 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             self._bridge_ws = None
             self._gateway_ready = False
 
+            if self._shutting_down:
+                self.ctx.logger.info("插件正在关闭，侧车不再重启")
+                return
             if exit_code == 0:
                 return
             if exit_code == 2:
