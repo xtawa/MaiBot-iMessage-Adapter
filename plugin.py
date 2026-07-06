@@ -92,7 +92,6 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
         self._ws_connected = asyncio.Event()
         self._ws_server = await self._start_ws_server(ws_port)
-        self.ctx.logger.info("WebSocket Server 已启动: 127.0.0.1:%d", ws_port)
 
         sidecar_dir = Path(__file__).parent / "sidecar"
         await self._launch_sidecar(sidecar_dir, ws_port)
@@ -209,7 +208,16 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
             await self._recv_loop(websocket)
 
-        server = await websockets.serve(ws_handler, "127.0.0.1", port)
+        max_bytes = self.config.bridge.max_attachment_size_mb * 1024 * 1024
+        server = await websockets.serve(
+            ws_handler, "127.0.0.1", port,
+            max_size=max_bytes,
+        )
+        self.ctx.logger.info(
+            "WebSocket Server 已启动: 127.0.0.1:%d，最大附件大小: %d MB",
+            port,
+            self.config.bridge.max_attachment_size_mb,
+        )
         return server
 
     async def _recv_loop(self, websocket) -> None:
@@ -429,6 +437,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             "BRIDGE_WS_TOKEN": self._bridge_token,
             "PHOTON_PROJECT_ID": self.config.photon.project_id,
             "PHOTON_PROJECT_SECRET": self.config.photon.project_secret,
+            "MAX_ATTACHMENT_SIZE_MB": str(self.config.bridge.max_attachment_size_mb),
         }
 
         self._sidecar_process = await asyncio.create_subprocess_exec(
@@ -574,13 +583,6 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                     "binary_data_base64": data_base64,
                     "hash": "",
                 })
-            elif att_type == "voice":
-                raw_message.append({
-                    "type": "voice",
-                    "data": att.get("name", ""),
-                    "binary_data_base64": data_base64,
-                    "hash": "",
-                })
             else:
                 raw_message.append({"type": "dict", "data": att})
 
@@ -659,13 +661,8 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                         "data_base64": b64,
                     })
             elif comp_type == "voice":
-                b64 = component.get("binary_data_base64", "")
-                if b64:
-                    attachments.append({
-                        "type": "voice",
-                        "mime_type": "audio/m4a",
-                        "data_base64": b64,
-                    })
+                # 语音不支持（Photon AttachmentService 对 iMessage 语音附件下载有 bug）
+                self.ctx.logger.warning("不支持发送语音消息，已跳过")
 
         payload_text = "".join(payload_text_parts)
 

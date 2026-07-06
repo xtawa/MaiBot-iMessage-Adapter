@@ -39,7 +39,7 @@ MaiBot (plugin.py)  ←─本地 WebSocket─→  Node.js 侧车  ←─spectrum
 ```
 
 - **Python 端**：负责 WebSocket Server、侧车进程管理、MaiBot SDK 组件注册
-- **Node.js 侧车**：薄壳，只调 `spectrum-ts` 官方 SDK，不写任何 Photon 协议代码
+- **Node.js 侧车**：薄壳，调用 `spectrum-ts` 官方 SDK发送接收消息
 
 
 
@@ -58,6 +58,7 @@ MaiBot (plugin.py)  ←─本地 WebSocket─→  Node.js 侧车  ←─spectrum
 | `[bridge]` | `ws_port` | int | 18763 | 本地桥接 WebSocket 端口 |
 | `[bridge]` | `max_retries` | int | 3 | 侧车崩溃最大重启次数 |
 | `[bridge]` | `retry_interval` | float | 3.0 | 重启间隔（秒） |
+| `[bridge]` | `max_attachment_size_mb` | int | 10 | 最大附件大小（MB） |
 
 ### 使用 (MaiBot配置)
 MaiBot Core 仍会用主配置里的 bot 平台账号识别“机器人自己”。因此在启用此插件后，必须在MaiBot配置文件夹下的bot_config.toml中的 `[bot]` 部分中的 `platforms = []` 这个配置项加入以下信息:
@@ -71,7 +72,7 @@ nickname = "麦麦" # 根据你的要求来改
 alias_names = [] 
 ```
 
-当然，如果你不喜欢直接编辑配置文件，也可以在WebUI中设置，具体方法是:`麦麦设置-基础-平台账号右边的加号-平台imessage,账号就是+10000000000`。
+当然，如果你不喜欢直接编辑配置文件，也可以在WebUI中设置，具体方法是:`麦麦设置-基础-平台账号右边的加号-平台imessage,账号就是+10000000000` (请填写自己的项目信息)。
 不设置将无法正常发送信息。
 
 初次使用必须先通过iMessage向Photon平台提供的号码发送信息，否则因平台限制将会出现`AuthenticationError: [spectrum-imessage] Target not allowed for this project`错误。
@@ -88,6 +89,24 @@ Photon免费的计划不支持电子邮件地址的iMessage !
 
 - **收消息**：他人通过 iMessage 发给你 → 自动注入 MaiBot 消息管道 → LLM 回复
 - **发消息**：MaiBot 生成的回复 → 自动通过 iMessage 发送
+
+## 注意事项
+
+### 不支持的消息类型
+
+受限于 Photon 云端服务和MaiBot能力，以下消息类型**无法**正常收发，插件会自动拦截并记录日志：
+
+| 消息类型 | 说明 |
+|----------|------|
+| 语音消息 (`.caf`) | Photon 的 AttachmentService 对 iMessage 语音附件下载存在 bug（gRPC `UNAVAILABLE`），已在侧车层拦截 |
+| 实况图片 (`.heic` / `.heif`) | Apple 实况图片格式无法被麦麦解析，已在侧车层拦截 |
+| 联系人名片 (vCard) | 联系人名片可作为 meta 信息接收，但不会生成可读消息内容 |
+
+### 其他限制
+
+- **免费版 Photon 不支持电子邮件地址的 iMessage**，仅支持手机号
+- **免费版 Photon 不支持主动发起会话**，必须先由对方通过 iMessage 向 Photon 号码发送首条消息后，才能回复
+- **附件大小**受 WebUI「最大附件大小」配置项控制（默认 10 MB），超出后 WebSocket 帧会被拒绝
 
 ## 故障排查
 

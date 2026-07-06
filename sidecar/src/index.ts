@@ -11,7 +11,7 @@
  *   3. 把 SDK 的 Message/Space 翻译成简化 JSON
  */
 
-import { Spectrum, text, attachment, voice } from "spectrum-ts";
+import { Spectrum, text, attachment } from "spectrum-ts";
 import { imessage } from "spectrum-ts/providers/imessage";
 import { WebSocket } from "ws";
 
@@ -43,6 +43,11 @@ if (!PROJECT_SECRET) {
   process.exit(1);
 }
 
+const MAX_ATTACHMENT_MB = parseInt(process.env.MAX_ATTACHMENT_SIZE_MB ?? "", 10);
+const MAX_PAYLOAD = (Number.isFinite(MAX_ATTACHMENT_MB) && MAX_ATTACHMENT_MB > 0)
+  ? MAX_ATTACHMENT_MB * 1024 * 1024
+  : 10 * 1024 * 1024; // fallback 默认 10 MB
+
 // ---------------------------------------------------------------------------
 // 2. 初始化 spectrum-ts 官方 SDK
 //    SDK 内部自动完成: JWT 认证、Fusor WS 连接、心跳、重连、token 刷新
@@ -65,7 +70,10 @@ try {
 // 3. 连接 Python WebSocket Server
 // ---------------------------------------------------------------------------
 
-const pyWs = new WebSocket(`ws://127.0.0.1:${PORT}`);
+const pyWs = new WebSocket(`ws://127.0.0.1:${PORT}`, {
+  maxPayload: MAX_PAYLOAD,
+});
+console.log("[sidecar] 连接到 Python WebSocket，最大附件大小: %d MB", Math.round(MAX_PAYLOAD / 1024 / 1024));
 
 // 3a. 认证握手
 try {
@@ -137,29 +145,54 @@ const spaceCache = new Map<string, typeof currentSpace>();
         case "text":
           textContent = message.content.text;
           break;
-        case "attachment":
-        case "voice": {
+        case "attachment": {
+          const mime: string = (message.content as any).mimeType ?? "";
+          const cname: string = (message.content as any).name ?? "";
+
+          // 语音消息：mime=application/octet-stream，文件名 .caf
+          if (mime.startsWith("audio/") || cname.endsWith(".caf")) {
+            console.log(
+              "[sidecar] 收到 CAF 音频格式的信息，MaiBot 不支持处理此类格式的信息，将跳过本条消息（发送者: %s）",
+              message.sender?.id ?? "未知",
+            );
+            continue;
+          }
+
+          // 实况图片：mime=image/heic
+          if (mime === "image/heic" || mime === "image/heif" || cname.endsWith(".heic") || cname.endsWith(".heif")) {
+            console.log(
+              "[sidecar] 收到 HEIC 实况图片格式的信息，MaiBot 不支持处理此类格式的信息，将跳过本条消息（发送者: %s）",
+              message.sender?.id ?? "未知",
+            );
+            continue;
+          }
           try {
             const buf: Buffer = await (message.content as any).read();
             const att: Record<string, unknown> = {
-              type: message.content.type === "voice" ? "voice" : "image",
+              type: "image",
               mime_type: message.content.mimeType,
               data_base64: buf.toString("base64"),
             };
             if (message.content.name) att.name = message.content.name;
             if ((message.content as any).size != null) att.size = (message.content as any).size;
-            if (message.content.type === "voice" && (message.content as any).duration != null) {
-              att.duration = (message.content as any).duration;
-            }
             attachments.push(att);
           } catch (err) {
             console.error("[sidecar] 读取附件内容失败:", err);
           }
           break;
         }
+        case "voice":
+          console.log(
+            "[sidecar] 收到语音格式的信息，MaiBot 不支持处理此类格式的信息，将跳过本条消息（发送者: %s）",
+            message.sender?.id ?? "未知",
+          );
+          continue; // 不转发给 Python
         default:
-          console.log("[sidecar] 未处理的消息类型:", message.content.type);
-          break;
+          console.log(
+            "[sidecar] 收到 %s 格式的信息，MaiBot 不支持处理此类格式的信息，将跳过本条消息",
+            message.content.type,
+          );
+          continue; // 不转发给 Python
       }
 
       pyWs.send(
@@ -258,20 +291,15 @@ pyWs.on("message", async (raw) => {
       // Attachments (if any)
       const atts: any[] = msg.data.attachments ?? [];
       for (const att of atts) {
+        if (att.type === "voice") {
+          console.log("[sidecar] 不支持发送语音消息，已跳过");
+          continue;
+        }
         const mimeType = att.mime_type || "application/octet-stream";
         const buf = Buffer.from(att.data_base64, "base64");
-
-        if (att.type === "voice") {
-          const opts: Record<string, unknown> = { mimeType };
-          if (att.name) opts.name = att.name;
-          if (att.duration != null) opts.duration = att.duration;
-          contents.push(voice(buf, opts as any));
-        } else {
-          // Default to attachment for "image" and any other type
-          const opts: Record<string, unknown> = { mimeType };
-          if (att.name) opts.name = att.name;
-          contents.push(attachment(buf, opts as any));
-        }
+        const opts: Record<string, unknown> = { mimeType };
+        if (att.name) opts.name = att.name;
+        contents.push(attachment(buf, opts as any));
       }
 
       if (contents.length === 0) {

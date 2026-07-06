@@ -11,6 +11,7 @@ SUPPORTED_CONFIG_VERSION = "1.0.0"
 DEFAULT_WS_PORT = 18763
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_INTERVAL = 3.0
+DEFAULT_MAX_ATTACHMENT_SIZE_MB = 10
 
 
 def _schema_i18n(
@@ -172,6 +173,21 @@ class SidecarBridgeConfig(PluginConfigBase):
             "label": "重启间隔（秒）",
             "order": 2,
             "step": 0.5,
+        },
+    )
+    max_attachment_size_mb: int = Field(
+        default=DEFAULT_MAX_ATTACHMENT_SIZE_MB,
+        description="最大附件大小（MB），超出此大小的附件将被拒绝，仅限图片等支持的媒体类型。",
+        json_schema_extra={
+            "hint": "设置过大可能导致 WebSocket 帧超限或内存占用过高。建议 1–50 MB。",
+            "i18n": _schema_i18n(
+                label_en="Max attachment size (MB)",
+                label_ja="最大添付ファイルサイズ (MB)",
+                hint_en="Overly large values may cause WebSocket frame overflow or high memory usage. Recommended: 1–50 MB.",
+                hint_ja="大きすぎると WebSocket フレーム超過やメモリ使用量の増加を招く可能性があります。推奨: 1～50 MB。",
+            ),
+            "label": "最大附件大小（MB）",
+            "order": 3,
         },
     )
 
