@@ -8,7 +8,7 @@
     "name": "mayan613",
     "url": "https://github.com/mayan613"
   },
-  "license": "GPLv3",
+  "license": "GPL-3.0",
   "urls": {
     "repository": "https://github.com/mayan613/iMessage-Adapter",
     "homepage": "https://www.galeros.xyz",
@@ -37,7 +37,7 @@
       "value": "wrench"
     }
   },
-  "capabilities": ["send_message"],
+  "capabilities": ["send.text", "send.image", "send.emoji", "send.forward", "send.custom"],
   "i18n": {
     "default_locale": "zh-CN",
     "locales_path": "i18n",

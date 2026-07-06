@@ -556,7 +556,36 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         """将侧车 JSON 转换为 MaiBot 标准的入站消息字典。"""
         sender = data.get("sender", {})
         chat_id = str(data.get("chat_id", ""))
-        text = str(data.get("text", ""))
+        text = str(data.get("text", "") or "")
+
+        raw_message: list[dict] = []
+
+        if text:
+            raw_message.append({"type": "text", "data": text})
+
+        for att in data.get("attachments", []) or []:
+            att_type = str(att.get("type", "")).strip().lower()
+            data_base64 = att.get("data_base64", "")
+
+            if att_type == "image":
+                raw_message.append({
+                    "type": "image",
+                    "data": "",
+                    "binary_data_base64": data_base64,
+                    "hash": "",
+                })
+            elif att_type == "voice":
+                raw_message.append({
+                    "type": "voice",
+                    "data": att.get("name", ""),
+                    "binary_data_base64": data_base64,
+                    "hash": "",
+                })
+            else:
+                raw_message.append({"type": "dict", "data": att})
+
+        if not raw_message:
+            raw_message = [{"type": "text", "data": ""}]
 
         return {
             "message_id": data.get("message_id", ""),
@@ -569,7 +598,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                 },
                 "additional_config": {},
             },
-            "raw_message": [{"type": "text", "data": text}],
+            "raw_message": raw_message,
         }
 
     """╔══════════════════════════════════════════════
@@ -593,11 +622,10 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         """出站入口：将 MaiBot 回复通过侧车发送到 iMessage。"""
         del route, metadata, kwargs
 
-        raw_text = str(message.get("processed_plain_text", "") or "")
         session_id = str(message.get("session_id", "") or "")
 
-        if not raw_text or not session_id:
-            return {"success": False, "error": "缺少消息内容或目标"}
+        if not session_id:
+            return {"success": False, "error": "缺少目标会话"}
 
         message_info = message.get("message_info", {})
         additional_config = message_info.get("additional_config", {}) if isinstance(message_info, dict) else {}
@@ -607,13 +635,54 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         if self._bridge_ws is None or not self._gateway_ready:
             return {"success": False, "error": "iMessage 网关未就绪"}
 
+        # Build text and attachments from raw_message
+        raw_message = message.get("raw_message", [])
+        if not isinstance(raw_message, list):
+            raw_message = []
+
+        payload_text_parts: list[str] = []
+        attachments: list[dict] = []
+
+        for component in raw_message:
+            if not isinstance(component, dict):
+                continue
+            comp_type = str(component.get("type", "")).strip().lower()
+
+            if comp_type == "text":
+                payload_text_parts.append(str(component.get("data", "")))
+            elif comp_type == "image":
+                b64 = component.get("binary_data_base64", "")
+                if b64:
+                    attachments.append({
+                        "type": "image",
+                        "mime_type": "image/png",
+                        "data_base64": b64,
+                    })
+            elif comp_type == "voice":
+                b64 = component.get("binary_data_base64", "")
+                if b64:
+                    attachments.append({
+                        "type": "voice",
+                        "mime_type": "audio/m4a",
+                        "data_base64": b64,
+                    })
+
+        payload_text = "".join(payload_text_parts)
+
+        # Fallback: if raw_message was empty, use legacy processed_plain_text
+        if not payload_text and not attachments:
+            payload_text = str(message.get("processed_plain_text", "") or "")
+
+        if not payload_text and not attachments:
+            return {"success": False, "error": "缺少消息内容或目标"}
+
         try:
             payload = {
                 "type": "send",
                 "data": {
                     "chat_id": chat_id,
-                    "text": raw_text,
-                    "attachments": [],
+                    "text": payload_text,
+                    "attachments": attachments,
                 },
             }
             await self._bridge_ws.send(json.dumps(payload, ensure_ascii=False))

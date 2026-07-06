@@ -11,7 +11,7 @@
  *   3. 把 SDK 的 Message/Space 翻译成简化 JSON
  */
 
-import { Spectrum, text } from "spectrum-ts";
+import { Spectrum, text, attachment, voice } from "spectrum-ts";
 import { imessage } from "spectrum-ts/providers/imessage";
 import { WebSocket } from "ws";
 
@@ -129,26 +129,56 @@ const spaceCache = new Map<string, typeof currentSpace>();
       currentSpace = space;
       spaceCache.set(space.id, space);
 
-      if (message.content.type === "text") {
-        pyWs.send(
-          JSON.stringify({
-            type: "message",
-            data: {
-              message_id: message.id,
-              chat_id: space.id,
-              sender: {
-                name: message.sender?.id ?? "未知",
-                address: message.sender?.id ?? "",
-              },
-              text: message.content.text,
-              timestamp: message.timestamp?.getTime() ?? Date.now(),
-              is_from_me: message.direction === "outbound",
-              attachments: [],
-            },
-          }),
-        );
+      // Build the uniform message data object
+      let textContent = "";
+      const attachments: Record<string, unknown>[] = [];
+
+      switch (message.content.type) {
+        case "text":
+          textContent = message.content.text;
+          break;
+        case "attachment":
+        case "voice": {
+          try {
+            const buf: Buffer = await (message.content as any).read();
+            const att: Record<string, unknown> = {
+              type: message.content.type === "voice" ? "voice" : "image",
+              mime_type: message.content.mimeType,
+              data_base64: buf.toString("base64"),
+            };
+            if (message.content.name) att.name = message.content.name;
+            if ((message.content as any).size != null) att.size = (message.content as any).size;
+            if (message.content.type === "voice" && (message.content as any).duration != null) {
+              att.duration = (message.content as any).duration;
+            }
+            attachments.push(att);
+          } catch (err) {
+            console.error("[sidecar] 读取附件内容失败:", err);
+          }
+          break;
+        }
+        default:
+          console.log("[sidecar] 未处理的消息类型:", message.content.type);
+          break;
       }
-      // 后续版本可扩展: attachment / reaction / group 等 content.type
+
+      pyWs.send(
+        JSON.stringify({
+          type: "message",
+          data: {
+            message_id: message.id,
+            chat_id: space.id,
+            sender: {
+              name: message.sender?.id ?? "未知",
+              address: message.sender?.id ?? "",
+            },
+            text: textContent,
+            timestamp: message.timestamp?.getTime() ?? Date.now(),
+            is_from_me: message.direction === "outbound",
+            attachments,
+          },
+        }),
+      );
     }
   } catch (err) {
     console.error("[sidecar] Photon 消息循环异常退出:", err);
@@ -173,32 +203,90 @@ const spaceCache = new Map<string, typeof currentSpace>();
 // 5. 接收 Python 指令
 // ---------------------------------------------------------------------------
 
+async function resolveSpace(targetId: string): Promise<typeof currentSpace | null> {
+  if (currentSpace && currentSpace.id === targetId) {
+    return currentSpace;
+  }
+  if (spaceCache.has(targetId)) {
+    return spaceCache.get(targetId)!;
+  }
+  // Cold send
+  console.log("[sidecar] 冷发送到: chat_id=" + targetId);
+  const im = imessage(app);
+  const space = await im.space.get(targetId);
+  if (!space) {
+    console.warn("[sidecar] im.space.get 返回 null，无法发送到 " + targetId);
+    return null;
+  }
+  spaceCache.set(space.id, space as typeof currentSpace);
+  return space as typeof currentSpace;
+}
+
 pyWs.on("message", async (raw) => {
   const msg = JSON.parse(raw.toString());
 
   if (msg.type === "send") {
-    // 调 SDK 的发送 API：发送纯文本
     try {
       let targetId = msg.data.chat_id.trim();
       // 兼容旧格式：裸号码自动补 DM 前缀
       if (!targetId.startsWith("any;-;") && !targetId.startsWith("any;+;")) {
         targetId = `any;-;${targetId}`;
       }
-      if (currentSpace && currentSpace.id === targetId) {
-        await currentSpace.send(text(msg.data.text));
-      } else if (spaceCache.has(targetId)) {
-        await spaceCache.get(targetId)!.send(text(msg.data.text));
-      } else {
-        // 冷发送：通过 im.space.get() 获取 Space，再调用 .send()
-        console.log("[sidecar] 冷发送到: chat_id=" + targetId);
-        const im = imessage(app);
-        const space = await im.space.get(targetId);
-        if (space) {
-          await space.send(text(msg.data.text));
+
+      const space = await resolveSpace(targetId);
+      if (!space) {
+        pyWs.send(
+          JSON.stringify({
+            type: "error",
+            code: "SEND_FAILED",
+            message: "无法解析目标空间: " + targetId,
+            fatal: false,
+          }),
+        );
+        return;
+      }
+
+      // Build content array for space.send()
+      const contents: any[] = [];
+
+      // Text (if any)
+      const msgText = (msg.data.text ?? "").trim();
+      if (msgText) {
+        contents.push(text(msgText));
+      }
+
+      // Attachments (if any)
+      const atts: any[] = msg.data.attachments ?? [];
+      for (const att of atts) {
+        const mimeType = att.mime_type || "application/octet-stream";
+        const buf = Buffer.from(att.data_base64, "base64");
+
+        if (att.type === "voice") {
+          const opts: Record<string, unknown> = { mimeType };
+          if (att.name) opts.name = att.name;
+          if (att.duration != null) opts.duration = att.duration;
+          contents.push(voice(buf, opts as any));
         } else {
-          console.warn("[sidecar] im.space.get 返回 null，无法发送到 " + targetId);
+          // Default to attachment for "image" and any other type
+          const opts: Record<string, unknown> = { mimeType };
+          if (att.name) opts.name = att.name;
+          contents.push(attachment(buf, opts as any));
         }
       }
+
+      if (contents.length === 0) {
+        pyWs.send(
+          JSON.stringify({
+            type: "error",
+            code: "SEND_FAILED",
+            message: "没有可发送的内容",
+            fatal: false,
+          }),
+        );
+        return;
+      }
+
+      await (space as any).send(...contents);
     } catch (err) {
       console.error("[sidecar] 发送消息失败:", err);
       pyWs.send(
