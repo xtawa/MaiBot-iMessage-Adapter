@@ -40,7 +40,7 @@
   "capabilities": ["send_message"],
   "i18n": {
     "default_locale": "zh-CN",
-    "locales_path": "",
+    "locales_path": "i18n",
     "supported_locales": ["zh-CN", "en-US", "ja_JP"]
   }
 }
