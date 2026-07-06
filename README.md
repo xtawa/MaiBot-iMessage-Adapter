@@ -1,6 +1,35 @@
-# iMessage 适配器插件
+# MaiBot-iMessage-Adapter
 
-通过 Photon Spectrum 云端将 MaiBot 接入 Apple iMessage，实现消息双向收发。
+**MaiBot 的 iMessage 平台适配器插件**
+
+通过 Photon Spectrum 云端将 [MaiBot](https://github.com/Mai-with-u/MaiBot) 接入 Apple iMessage，实现消息双向收发。
+
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-AGPL--v3-green.svg)](LICENSE)
+[![maibot-plugin-sdk](https://img.shields.io/badge/SDK-maibot--plugin--sdk-orange)](https://github.com/Mai-with-u/maibot-plugin-sdk)
+
+
+### 安装
+
+将本仓库克隆到 MaiBot 的 `plugins/` 下即可。
+
+```
+cd /path/to/MaiBot/plugins
+git clone https://github.com/mayan613/MaiBot-iMessage-Adapter.git
+```
+
+### 前置条件
+
+| 依赖 | 最低版本 | 用途 |
+|------|----------|------|
+| nodeenv (PyPI) | ≥ 1.10.0 | 系统无 Node.js 时自动安装到插件目录下 |
+| Node.js | ≥ 18 | 侧车运行时。插件优先使用系统安装的 Node.js；若未找到，会自动通过 nodeenv 安装到插件目录下的 `.nodeenv/` |
+| Photon 账号 | — | iMessage 云端服务，在 [app.photon.codes](https://app.photon.codes) 注册 |
+| MaiBot | ≥ 1.0.0 | 插件宿主 |
+
+
+首次启用时，插件会在插件目录下通过 `nodeenv` 自动提供 Node.js 运行时（若系统已有则跳过），然后自动执行 `npm install` 安装侧车依赖并编译 TypeScript（约 150 个包，可能需要 1-2 分钟）。后续启动将跳过此步骤。
+
 
 ## 架构
 
@@ -12,42 +41,41 @@ MaiBot (plugin.py)  ←─本地 WebSocket─→  Node.js 侧车  ←─spectrum
 - **Python 端**：负责 WebSocket Server、侧车进程管理、MaiBot SDK 组件注册
 - **Node.js 侧车**：薄壳，只调 `spectrum-ts` 官方 SDK，不写任何 Photon 协议代码
 
-## 前置条件
 
-| 依赖 | 最低版本 | 用途 |
-|------|----------|------|
-| nodeenv (PyPI) | ≥ 1.10.0 | 系统无 Node.js 时自动安装（由 MaiBot 依赖流水线自动管理） |
-| Node.js | ≥ 18 | 侧车运行时。插件优先使用系统安装的 Node.js；若未找到，会自动通过 nodeenv 安装到插件目录下的 `.nodeenv/` |
-| Photon 账号 | — | iMessage 云端服务，在 [app.photon.codes](https://app.photon.codes) 注册 |
-| MaiBot | ≥ 1.0.0 | 插件宿主 |
-
-## 安装
-
-将插件目录放入 MaiBot 的 `plugins/` 下即可。
-
-```
-plugins/iMessage-Adapter/
-```
-
-首次启用时，插件会在插件目录下通过 `nodeenv` 自动提供 Node.js 运行时（若系统已有则跳过），然后自动执行 `npm install` 安装侧车依赖并编译 TypeScript（约 150 个包，可能需要 1-2 分钟）。后续启动将跳过此步骤。
 
 ## 配置
 
-插件配置通过 MaiBot WebUI 的插件配置页面修改。`config.toml` 由系统自动生成和管理，请勿手动编辑。
+插件配置可通过 MaiBot WebUI 的插件配置页面修改。
 
 ### 配置项说明
 
 | 配置节 | 字段 | 类型 | 默认值 | 说明 |
 |--------|------|------|--------|------|
 | `[plugin]` | `enabled` | bool | false | 是否启用适配器 |
-| `[plugin]` | `config_version` | str | 1.0.0 | 配置版本（系统自动管理） |
+| `[plugin]` | `config_version` | str | 1.0.0 | 配置版本（无需变更） |
 | `[photon]` | `project_id` | str | "" | Photon 项目 ID |
 | `[photon]` | `project_secret` | str | "" | Photon 项目密钥 |
 | `[bridge]` | `ws_port` | int | 18763 | 本地桥接 WebSocket 端口 |
 | `[bridge]` | `max_retries` | int | 3 | 侧车崩溃最大重启次数 |
 | `[bridge]` | `retry_interval` | float | 3.0 | 重启间隔（秒） |
 
-## 使用
+### 使用 (MaiBot配置)
+MaiBot Core 仍会用主配置里的 bot 平台账号识别“机器人自己”。因此在启用此插件后，必须在MaiBot配置文件夹下的bot_config.toml中的 `[bot]` 部分中的 `platforms = []` 这个配置项加入以下信息:
+```toml
+[bot]
+platform = "" # 这项保持为空(如果你没有主要的平台)
+qq_account = "" # 和上个参数要求一致
+platforms = ["imessage:+10000000000"] # 重要: 格式要求为 "imessage:+10000000000"
+# "imessage:" 后跟的+1数字是你的Photon项目所分配的号码，请通过[Photon Dashboard] (https://app.photon.codes/dashboard/)获取。
+nickname = "麦麦" # 根据你的要求来改
+alias_names = [] 
+```
+
+当然，如果你不喜欢直接编辑配置文件，也可以在WebUI中设置，具体方法是:`麦麦设置-基础-平台账号右边的加号-平台imessage,账号就是+10000000000`。
+不设置将无法正常发送信息。
+
+初次使用必须先通过iMessage向Photon平台提供的号码发送信息，否则因平台限制将会出现`AuthenticationError: [spectrum-imessage] Target not allowed for this project`错误。
+Photon免费的计划不支持电子邮件地址的iMessage !
 
 ### 管理命令
 
@@ -71,15 +99,8 @@ plugins/iMessage-Adapter/
 | 能收不能发 | 网关未就绪 | 等待 Photon 完全连接后重试，或用 `/imessage_status` 确认状态 |
 | 端口冲突 | 18763 被其他程序占用 | 在 WebUI 中修改「桥接端口」配置 |
 
-## 开发
 
-```bash
-# Python 端
-pip install maibot-plugin-sdk websockets
 
-# Node.js 侧车
-cd sidecar
-npm install
-npm run build    # 编译 TypeScript
-node dist/index.js  # 手动启动（调试时由 Python 环境变量传参）
-```
+## 许可证
+
+本项目基于 AGPLv3 许可证开源。
