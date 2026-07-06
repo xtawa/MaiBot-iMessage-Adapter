@@ -1,14 +1,14 @@
 {
   "manifest_version": 2,
   "id": "com.galeros.imessage_adapter",
-  "version": "0.0.1",
+  "version": "0.1.2",
   "name": "iMessage 连接器 / iMessage Adapter",
   "description": "将你的MaiBot通过Photon连接到iMessage，允许通过iMessage发送和接收消息。",
   "author": {
     "name": "mayan613",
     "url": "https://github.com/mayan613"
   },
-  "license": "MIT",
+  "license": "GPLv3",
   "urls": {
     "repository": "https://github.com/mayan613/iMessage-Adapter",
     "homepage": "https://www.galeros.xyz",
@@ -40,7 +40,7 @@
   "capabilities": ["send_message"],
   "i18n": {
     "default_locale": "zh-CN",
-    "locales_path": "i18n",
-    "supported_locales": ["zh-CN", "en-US"]
+    "locales_path": "",
+    "supported_locales": ["zh-CN", "en-US", "ja_JP"]
   }
 }

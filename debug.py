@@ -16,11 +16,13 @@ from typing import Any
 # ═══════════════════════════════════════════════════════════════
 
 # 是否启用调试发送（设为 False 可临时关闭）
-ENABLED = True
+ENABLED = False
 
 # 目标 chat_id（iMessage 的 space.id，即手机号，带国家代码）
-# 格式示例: "+8613800138000"（sidecar 会自动补 any;-; 前缀）
-TARGET_CHAT_ID = "+447591971774"
+# 格式示例: "+8613800138000"
+# 温馨提示: photon spectrum免费版不支持先发送消息到目标手机号，需要先接收一条消息才可发送。
+# 免费版订阅不支持电子邮件地址的imessage. 
+TARGET_CHAT_ID = "+861000000000"
 
 # 要发送的文本内容
 MESSAGE_TEXT = "Hello from MaiBot iMessage Adapter (debug)"
