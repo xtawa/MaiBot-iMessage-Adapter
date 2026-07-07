@@ -10,10 +10,10 @@
   },
   "license": "GPL-3.0",
   "urls": {
-    "repository": "https://github.com/mayan613/iMessage-Adapter",
-    "homepage": "https://www.galeros.xyz",
-    "documentation": "https://docs.example.com",
-    "issues": "https://github.com/mayan613/iMessage-Adapter/issues"
+    "repository": "https://github.com/mayan613/MaiBot-iMessage-Adapter",
+    "homepage": "https://github.com/mayan613/MaiBot-iMessage-Adapter",
+    "documentation": "https://www.galeros.xyz/2026/07/07/imessage-adapter",
+    "issues": "https://github.com/mayan613/MaiBot-iMessage-Adapter/issues"
   },
   "host_application": {
     "min_version": "1.0.0",
@@ -40,7 +40,6 @@
   "capabilities": ["send.text", "send.image", "send.emoji", "send.forward", "send.custom"],
   "i18n": {
     "default_locale": "zh-CN",
-    "locales_path": "i18n",
     "supported_locales": ["zh-CN", "en-US", "ja_JP"]
   }
 }
