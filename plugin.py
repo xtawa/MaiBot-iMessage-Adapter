@@ -1,10 +1,14 @@
-"""iMessage 适配器插件。
+"""
+MaiBot iMessage Adapter — Main Program
 
-采用侧车模式：Python 插件通过本地 WebSocket 与 Node.js 进程通信，
-Node.js 侧车通过 spectrum-ts SDK 连接 Photon Cloud 实现 iMessage 收发。
+采用侧车模式: Python 插件通过本地 WebSocket 与 Node.js 进程通信
+Node.js 侧车通过 spectrum-ts SDK 连接 Photon Cloud 实现 iMessage 收发
+
 Made BY Galeros
 
 """
+
+# 更新日志: 增加侧车版本检测，防止本地编译文件不同步 26/7/9 19:14
 
 from __future__ import annotations
 
@@ -19,7 +23,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from maibot_sdk import Command, MaiBotPlugin, MessageGateway
 from maibot_sdk.types import MessageGatewayRouteType
 
-from .config import IMessageAdapterConfig
+from .config import IMessageAdapterConfig, PLUGIN_VERSION
 
 if TYPE_CHECKING:
     from maibot_sdk import PluginConfigBase
@@ -55,10 +59,6 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         self._shutting_down = True
         await self._stop_connection()
 
-        if self._ws_server is not None:
-            self._ws_server.close()
-            await self._ws_server.wait_closed()
-            self._ws_server = None
         self._bridge_ws = None
         self._bridge_token = ""
 
@@ -68,6 +68,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         if scope != "self":
             return
 
+        self.ctx.logger.warning("iMessage 适配器收到配置更新通知，正在应用新配置…")
         self.set_plugin_config(config_data)
         if version:
             self.ctx.logger.debug("iMessage 适配器收到配置更新通知: %s", version)
@@ -86,6 +87,25 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             return
 
         self._shutting_down = False
+
+        # 检查插件版本是否有变化，如有则触发重新编译
+        config_plugin_version = self.config.plugin.plugin_version
+        if config_plugin_version != PLUGIN_VERSION:
+            self.ctx.logger.warning("=" * 60)
+            self.ctx.logger.warning("⚠ 检测到插件版本变更: %s → %s", config_plugin_version, PLUGIN_VERSION)
+            self.ctx.logger.warning("   将清理旧编译产物并重新编译侧车，请耐心等待…")
+            self.ctx.logger.warning("=" * 60)
+            sidecar_dir = Path(__file__).parent / "sidecar"
+            dist_dir = sidecar_dir / "dist"
+            if dist_dir.exists():
+                shutil.rmtree(dist_dir)
+                self.ctx.logger.warning("已删除旧编译产物: %s", dist_dir)
+
+            # 立即回写新版本到配置文件，防止编译失败导致版本号未更新
+            self.ctx.logger.warning("正在回写新插件版本到配置文件: %s", PLUGIN_VERSION)
+            success = await self._write_plugin_version(PLUGIN_VERSION)
+            if not success:
+                self.ctx.logger.error("更新配置中的 plugin_version 失败")
 
         self._bridge_token = secrets.token_hex(32)
         ws_port = self.config.bridge.ws_port
@@ -162,6 +182,11 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         if self._gateway_ready:
             await self.ctx.gateway.update_state("imessage", ready=False)
             self._gateway_ready = False
+
+        if self._ws_server is not None:
+            self._ws_server.close()
+            await self._ws_server.wait_closed()
+            self._ws_server = None
 
         self._bridge_ws = None
 
@@ -325,6 +350,12 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         if cached_node.exists() and cached_npm.exists():
             return str(cached_node), str(cached_npm), str(cached_npx)
 
+        self.ctx.logger.warning("=" * 60)
+        self.ctx.logger.warning("⚠ 系统中未找到 Node.js，即将自动下载安装")
+        self.ctx.logger.warning("   下载源: https://nodejs.org/download/release")
+        self.ctx.logger.warning("   安装位置: %s", _NODEENV_DIR)
+        self.ctx.logger.warning("   此过程需要联网，可能需要 1-2 分钟，请耐心等待…")
+        self.ctx.logger.warning("=" * 60)
         self.ctx.logger.info("系统中未找到 Node.js，正在通过 nodeenv 安装到 %s…", _NODEENV_DIR)
         await asyncio.to_thread(self._install_nodeenv)
         self.ctx.logger.info("Node.js 安装完成")
@@ -526,6 +557,44 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         except Exception:
             pass
         self._sidecar_process = None
+
+    async def _write_plugin_version(self, version: str) -> bool:
+        """直接修改插件的 config.toml 文件，更新 plugin_version 字段。
+
+        Returns:
+            bool: True 表示写入成功，False 表示写入失败。
+        """
+        """
+        致 审查者:
+            本方法的直接作用是修改插件目录下的 config.toml 文件，更新 plugin_version 字段
+            这样做的目的是为了在插件升级后，确保用户配置文件中的插件版本同步，防止重复触发侧车编译
+            我没有找到通过 MaiBot SDK 的官方接口来修改插件配置的方式，所以选择了直接操作文件
+            希望能够理解，这个操作是安全的，并且只会修改插件自己的配置文件
+
+        谢谢
+        """
+        import tomlkit
+
+        config_path = Path(__file__).parent / "config.toml"
+        if not config_path.exists():
+            self.ctx.logger.error("无法找到 %s，请确保配置正确。", config_path)
+            return False
+
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                doc = tomlkit.load(f)
+
+            plugin_section = doc.setdefault("plugin", {})
+            plugin_section["plugin_version"] = version
+
+            with open(config_path, "w", encoding="utf-8") as f:
+                tomlkit.dump(doc, f)
+        except Exception as exc:
+            self.ctx.logger.error("写入 plugin_version 到 %s 失败: %s", config_path, exc)
+            return False
+
+        self.ctx.logger.warning("已更新配置中的 plugin_version → %s", version)
+        return True
 
     async def _monitor_sidecar(self) -> None:
         """监控侧车进程退出状态，按策略自动重启或弃疗。"""

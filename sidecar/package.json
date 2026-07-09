@@ -1,6 +1,6 @@
 {
   "name": "maibot-imessage-sidecar",
-  "version": "0.1.0",
+  "version": "0.1.5",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,11 +9,11 @@
   },
   "dependencies": {
     "spectrum-ts": "^8.2.1",
-    "ws": "^8.16.0"
+    "ws": "^8.21.0"
   },
   "devDependencies": {
-    "@types/node": "^20.11.0",
-    "@types/ws": "^8.5.10",
-    "typescript": "^5.3.3"
+    "@types/node": "^26.1.1",
+    "@types/ws": "^8.18.1",
+    "typescript": "^7.0.2"
   }
 }

@@ -7,6 +7,8 @@ from typing import Any, ClassVar, Dict, Optional
 from maibot_sdk import Field, PluginConfigBase
 
 SUPPORTED_CONFIG_VERSION = "1.0.0"
+# 供插件作者方便追踪插件版本
+PLUGIN_VERSION = "0.1.5"
 
 DEFAULT_WS_PORT = 18763
 DEFAULT_MAX_RETRIES = 3
@@ -18,25 +20,33 @@ def _schema_i18n(
     *,
     label_en: str,
     label_ja: str,
+    label_ko: str,
     hint_en: Optional[str] = None,
     hint_ja: Optional[str] = None,
+    hint_ko: Optional[str] = None,
     placeholder_en: Optional[str] = None,
     placeholder_ja: Optional[str] = None,
+    placeholder_ko: Optional[str] = None,
 ) -> Dict[str, Dict[str, str]]:
     """构造 WebUI 配置项的多语言说明文本。"""
 
     i18n: Dict[str, Dict[str, str]] = {
         "en_US": {"label": label_en},
         "ja_JP": {"label": label_ja},
+        "ko_KR": {"label": label_ko},
     }
     if hint_en is not None:
         i18n["en_US"]["hint"] = hint_en
     if hint_ja is not None:
         i18n["ja_JP"]["hint"] = hint_ja
+    if hint_ko is not None:
+        i18n["ko_KR"]["hint"] = hint_ko
     if placeholder_en is not None:
         i18n["en_US"]["placeholder"] = placeholder_en
     if placeholder_ja is not None:
         i18n["ja_JP"]["placeholder"] = placeholder_ja
+    if placeholder_ko is not None:
+        i18n["ko_KR"]["placeholder"] = placeholder_ko
     return i18n
 
 
@@ -54,8 +64,10 @@ class IMessagePluginOptions(PluginConfigBase):
             "i18n": _schema_i18n(
                 label_en="Enable adapter",
                 label_ja="アダプターを有効化",
+                label_ko="어댑터 활성화",
                 hint_en="When disabled, the plugin stays idle and will not launch the sidecar process or connect to Photon.",
                 hint_ja="無効にすると、プラグインは待機状態のままになり、サイドカープロセスを起動せず、Photon にも接続しません。",
+                hint_ko="비활성화하면 플러그인이 대기 상태로 유지되며 사이드카 프로세스를 시작하지 않고 Photon에 연결하지 않습니다.",
             ),
             "label": "启用适配器",
             "order": 0,
@@ -67,9 +79,20 @@ class IMessagePluginOptions(PluginConfigBase):
         json_schema_extra={
             "disabled": True,
             "hidden": True,
-            "i18n": _schema_i18n(label_en="Config version", label_ja="設定バージョン"),
+            "i18n": _schema_i18n(label_en="Config version", label_ja="設定バージョン", label_ko="설정 버전"),
             "label": "配置版本",
             "order": 99,
+        },
+    )
+    plugin_version: str = Field(
+        default=PLUGIN_VERSION,
+        description="当前插件版本，用于跟踪插件升级。",
+        json_schema_extra={
+            "disabled": True,
+            "hidden": True,
+            "i18n": _schema_i18n(label_en="Plugin version", label_ja="プラグインバージョン", label_ko="플러그인 버전"),
+            "label": "插件版本",
+            "order": 100,
         },
     )
 
@@ -92,10 +115,13 @@ class PhotonServerConfig(PluginConfigBase):
             "i18n": _schema_i18n(
                 label_en="Project ID",
                 label_ja="プロジェクト ID",
+                label_ko="프로젝트 ID",
                 hint_en="Obtain from the Photon dashboard (app.photon.codes) after creating a project.",
                 hint_ja="Photon ダッシュボード (app.photon.codes) でプロジェクト作成後に取得します。",
+                hint_ko="Photon 대시보드(app.photon.codes)에서 프로젝트 생성 후 확인할 수 있습니다.",
                 placeholder_en="PROJECT_ID",
                 placeholder_ja="PROJECT_ID",
+                placeholder_ko="PROJECT_ID",
             ),
             "label": "项目 ID",
             "order": 0,
@@ -110,10 +136,13 @@ class PhotonServerConfig(PluginConfigBase):
             "i18n": _schema_i18n(
                 label_en="Project secret",
                 label_ja="プロジェクトシークレット",
+                label_ko="프로젝트 시크릿",
                 hint_en="The secret paired with the project ID. Keep it safe and never expose it.",
                 hint_ja="プロジェクト ID とペアになるシークレットです。安全に保管し、決して公開しないでください。",
+                hint_ko="프로젝트 ID와 페어링되는 시크릿입니다. 안전하게 보관하고 절대 공개하지 마십시오.",
                 placeholder_en="PROJECT_SECRET",
                 placeholder_ja="PROJECT_SECRET",
+                placeholder_ko="PROJECT_SECRET",
             ),
             "input_type": "password",
             "label": "项目密钥",
@@ -137,8 +166,10 @@ class SidecarBridgeConfig(PluginConfigBase):
             "i18n": _schema_i18n(
                 label_en="Bridge port",
                 label_ja="ブリッジポート",
+                label_ko="브리지 포트",
                 hint_en="Listens on 127.0.0.1 only. Change to another free port if it conflicts.",
                 hint_ja="127.0.0.1 のみで待受します。ポートが競合する場合は他の空きポートに変更してください。",
+                hint_ko="127.0.0.1에서만 수신 대기합니다. 포트가 충돌하면 다른 사용 가능한 포트로 변경하십시오.",
             ),
             "label": "桥接端口",
             "order": 0,
@@ -152,8 +183,10 @@ class SidecarBridgeConfig(PluginConfigBase):
             "i18n": _schema_i18n(
                 label_en="Max retries",
                 label_ja="最大リトライ回数",
+                label_ko="최대 재시도 횟수",
                 hint_en="After exceeding this count the plugin stops restarting. Run /imessage_reconnect or reload the plugin manually.",
                 hint_ja="この回数を超えるとプラグインは再起動を停止します。手動で /imessage_reconnect を実行するか、プラグインを再読み込みしてください。",
+                hint_ko="이 횟수를 초과하면 플러그인이 재시작을 중지합니다. 수동으로 /imessage_reconnect를 실행하거나 플러그인을 다시 로드하십시오.",
             ),
             "label": "最大重启次数",
             "order": 1,
@@ -167,8 +200,10 @@ class SidecarBridgeConfig(PluginConfigBase):
             "i18n": _schema_i18n(
                 label_en="Retry interval (sec)",
                 label_ja="リトライ間隔（秒）",
+                label_ko="재시도 간격(초)",
                 hint_en="Suggested at least 2 seconds to allow Photon to detect the disconnect.",
                 hint_ja="Photon サーバー側の切断検出のため、2 秒以上を推奨します。",
+                hint_ko="Photon 서버 측의 연결 해제 감지를 위해 2초 이상을 권장합니다.",
             ),
             "label": "重启间隔（秒）",
             "order": 2,
@@ -183,8 +218,10 @@ class SidecarBridgeConfig(PluginConfigBase):
             "i18n": _schema_i18n(
                 label_en="Max attachment size (MB)",
                 label_ja="最大添付ファイルサイズ (MB)",
+                label_ko="최대 첨부 파일 크기(MB)",
                 hint_en="Overly large values may cause WebSocket frame overflow or high memory usage. Recommended: 1–50 MB.",
                 hint_ja="大きすぎると WebSocket フレーム超過やメモリ使用量の増加を招く可能性があります。推奨: 1～50 MB。",
+                hint_ko="너무 큰 값은 WebSocket 프레임 초과 또는 높은 메모리 사용량을 초래할 수 있습니다. 권장: 1~50MB.",
             ),
             "label": "最大附件大小（MB）",
             "order": 3,

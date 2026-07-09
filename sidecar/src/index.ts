@@ -1,14 +1,13 @@
 /**
  * MaiBot iMessage Adapter — Sidecar
  *
- * 薄壳（Thin Shell）：不写任何 Photon 协议层代码。
- * 全部 Photon 功能（认证、Fusor WebSocket、心跳、重连、消息收发）
- * 由 spectrum-ts 官方 npm 包内置处理。
- *
- * 侧车只做三件事：
- *   1. 初始化 spectrum-ts SDK
- *   2. 连接 Python WebSocket Server，通过本地桥接转发消息
- *   3. 把 SDK 的 Message/Space 翻译成简化 JSON
+ * 任务:
+ * 初始化 spectrum-ts SDK
+ * 连接 Python WebSocket Server，通过本地桥接转发消息
+ * 把 SDK 的 Message/Space 翻译成简化 JSON
+ * 
+ * Made BY Galeros
+ * 
  */
 
 import { Spectrum, text, attachment } from "spectrum-ts";
@@ -50,7 +49,6 @@ const MAX_PAYLOAD = (Number.isFinite(MAX_ATTACHMENT_MB) && MAX_ATTACHMENT_MB > 0
 
 // ---------------------------------------------------------------------------
 // 2. 初始化 spectrum-ts 官方 SDK
-//    SDK 内部自动完成: JWT 认证、Fusor WS 连接、心跳、重连、token 刷新
 // ---------------------------------------------------------------------------
 
 let app: Awaited<ReturnType<typeof Spectrum>>;
@@ -116,7 +114,6 @@ console.log("[sidecar] 已向 Python 发送 ready 信号");
 
 // ---------------------------------------------------------------------------
 // 4. 消费 Photon 消息流 → 翻译 → 发给 Python
-//    app.messages 由 spectrum-ts 提供，是标准的 AsyncIterable
 // ---------------------------------------------------------------------------
 
 // 用于发送消息时引用当前的 space 上下文
