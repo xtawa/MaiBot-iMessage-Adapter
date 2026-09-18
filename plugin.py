@@ -110,25 +110,6 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
         self._shutting_down = False
 
-        # 检查插件版本是否有变化，如有则触发重新编译
-        config_plugin_version = self.config.plugin.plugin_version
-        if config_plugin_version != PLUGIN_VERSION:
-            self.ctx.logger.warning("=" * 60)
-            self.ctx.logger.warning("⚠ 检测到插件版本变更: %s → %s", config_plugin_version, PLUGIN_VERSION)
-            self.ctx.logger.warning("   将清理旧编译产物并重新编译侧车，请耐心等待…")
-            self.ctx.logger.warning("=" * 60)
-            sidecar_dir = Path(__file__).parent / "sidecar"
-            dist_dir = sidecar_dir / "dist"
-            if dist_dir.exists():
-                shutil.rmtree(dist_dir)
-                self.ctx.logger.warning("已删除旧编译产物: %s", dist_dir)
-
-            # 立即回写新版本到配置文件，防止编译失败导致版本号未更新
-            self.ctx.logger.warning("正在回写新插件版本到配置文件: %s", PLUGIN_VERSION)
-            success = await self._write_plugin_version(PLUGIN_VERSION)
-            if not success:
-                self.ctx.logger.error("更新配置中的 plugin_version 失败")
-
         self._bridge_token = secrets.token_hex(32)
         ws_port = self.config.bridge.ws_port
 
@@ -498,10 +479,28 @@ class IMessageAdapterPlugin(MaiBotPlugin):
     ╚══════════════════════════════════════════════"""
 
     async def _ensure_sidecar_built(self, sidecar_dir: Path) -> bool:
-        """确保侧车 TypeScript 已编译为 dist/index.js，必要时自动执行 npm install + tsc。"""
-        dist_file = sidecar_dir / "dist" / "index.js"
-        if dist_file.exists():
+        """确保侧车编译产物与当前插件版本一致，必要时重新构建。"""
+        dist_dir = sidecar_dir / "dist"
+        dist_file = dist_dir / "index.js"
+        version_file = dist_dir / ".adapter-version"
+
+        built_version = ""
+        if version_file.exists():
+            try:
+                built_version = version_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                built_version = ""
+
+        if dist_file.exists() and built_version == PLUGIN_VERSION:
             return True
+
+        if dist_dir.exists():
+            self.ctx.logger.warning(
+                "侧车编译产物需要刷新（built=%s current=%s），正在清理 dist",
+                built_version or "unknown",
+                PLUGIN_VERSION,
+            )
+            await asyncio.to_thread(shutil.rmtree, dist_dir, ignore_errors=True)
 
         node_path, npm_path, npx_path = await self._resolve_node_binaries()
 
@@ -565,7 +564,12 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             self.ctx.logger.error("tsc 编译完成后仍未找到 dist/index.js")
             return False
 
-        self.ctx.logger.info("侧车编译完成")
+        try:
+            version_file.write_text(PLUGIN_VERSION + "\n", encoding="utf-8")
+        except OSError as exc:
+            self.ctx.logger.warning("无法写入侧车构建版本标记 %s: %s", version_file, exc)
+
+        self.ctx.logger.info("侧车编译完成: adapter=%s", PLUGIN_VERSION)
         return True
 
     async def _launch_sidecar(self, sidecar_dir: Path, ws_port: int) -> None:
@@ -669,44 +673,6 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         except Exception:
             pass
         self._sidecar_process = None
-
-    async def _write_plugin_version(self, version: str) -> bool:
-        """直接修改插件的 config.toml 文件，更新 plugin_version 字段。
-
-        Returns:
-            bool: True 表示写入成功，False 表示写入失败。
-        """
-        """
-        致 审查者:
-            本方法的直接作用是修改插件目录下的 config.toml 文件，更新 plugin_version 字段
-            这样做的目的是为了在插件升级后，确保用户配置文件中的插件版本同步，防止重复触发侧车编译
-            我没有找到通过 MaiBot SDK 的官方接口来修改插件配置的方式，所以选择了直接操作文件
-            希望能够理解，这个操作是安全的，并且只会修改插件自己的配置文件
-
-        谢谢
-        """
-        import tomlkit
-
-        config_path = Path(__file__).parent / "config.toml"
-        if not config_path.exists():
-            self.ctx.logger.error("无法找到 %s，请确保配置正确。", config_path)
-            return False
-
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                doc = tomlkit.load(f)
-
-            plugin_section = doc.setdefault("plugin", {})
-            plugin_section["plugin_version"] = version
-
-            with open(config_path, "w", encoding="utf-8") as f:
-                tomlkit.dump(doc, f)
-        except Exception as exc:
-            self.ctx.logger.error("写入 plugin_version 到 %s 失败: %s", config_path, exc)
-            return False
-
-        self.ctx.logger.warning("已更新配置中的 plugin_version → %s", version)
-        return True
 
     async def _monitor_sidecar(self) -> None:
         """监控侧车进程退出状态，按策略自动重启或弃疗。"""
