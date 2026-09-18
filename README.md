@@ -101,21 +101,21 @@ Photon免费的计划不支持电子邮件地址的iMessage !
 
 | 消息类型 | 说明 |
 |----------|------|
-| 语音消息 (`.caf`) | Photon 的 AttachmentService 对 iMessage 语音附件下载存在 bug（gRPC `UNAVAILABLE`），已在侧车层拦截 |
+| 语音消息 (`.caf`) | Photon/Spectrum 目前仍可能把原生 iMessage 语音暴露为普通 CAF 附件；适配器暂不注入 MaiBot |
 | 实况图片 (`.heic` / `.heif`) | Apple 实况图片格式无法被麦麦解析，已在侧车层拦截 |
-| 联系人名片 (vCard) | 联系人名片可作为 meta 信息接收，但不会生成可读消息内容 |
+| 联系人名片 (vCard) | 会提取姓名、电话、邮箱并转换为可读文本；照片等扩展字段暂不展开 |
 
 ### 其他限制
 
 - **免费版 Photon 不支持电子邮件地址的 iMessage**，仅支持手机号
 - **免费版 Photon 不支持主动发起会话**，必须先由对方通过 iMessage 向 Photon 号码发送首条消息后，才能回复
-- **附件大小**受 WebUI「最大附件大小」配置项控制（默认 10 MB），超出后 WebSocket 帧会被拒绝
+- **附件大小**受 WebUI「最大附件大小」配置项控制（默认 10 MB）；桥接层会为 Base64/JSON 膨胀自动预留帧空间
 
 ## 故障排查
 
 | 症状 | 可能原因 | 解决 |
 |------|----------|------|
-| `/imessage_status` 显示未连接 | 侧车未安装依赖或编译失败 | 插件会自动执行 `npm install && tsc`，查看日志确认是否成功 |
+| `/imessage_status` 显示未连接 | 侧车未安装依赖或编译失败 | 插件会优先执行 `npm ci` 并编译 TypeScript，查看日志确认是否成功 |
 | Photon 认证失败 | project_id/project_secret 配置错误 | 在 WebUI 插件配置页面检查凭证是否正确 |
 | 侧车反复重启 | 网络问题或 Photon 服务异常 | 查看 MaiBot 日志中的 `[侧车]` 前缀消息 |
 | 能收不能发 | 网关未就绪 | 等待 Photon 完全连接后重试，或用 `/imessage_status` 确认状态 |
