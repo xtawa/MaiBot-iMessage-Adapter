@@ -141,6 +141,11 @@ const spaceCache = new Map<string, typeof currentSpace>();
 (async () => {
   try {
     for await (const [space, message] of app.messages) {
+      if (message.direction !== "inbound") {
+        console.log("[sidecar] 忽略自身 outbound 回声: message_id=%s", message.id);
+        continue;
+      }
+
       currentSpace = space;
       spaceCache.set(space.id, space);
 
@@ -278,8 +283,27 @@ pyWs.on("message", async (raw) => {
   }
 
   if (msg.type === "send") {
+    const requestId = typeof msg.request_id === "string" ? msg.request_id : "";
+    const sendResult = (
+      success: boolean,
+      error = "",
+      externalMessageId = "",
+    ): void => {
+      pyWs.send(JSON.stringify({
+        type: "send_result",
+        request_id: requestId,
+        success,
+        error,
+        external_message_id: externalMessageId,
+      }));
+    };
+
     try {
-      let targetId = msg.data.chat_id.trim();
+      let targetId = String(msg.data?.chat_id ?? "").trim();
+      if (!targetId) {
+        sendResult(false, "缺少目标 chat_id");
+        return;
+      }
       // 兼容旧格式：裸号码自动补 DM 前缀
       if (!targetId.startsWith("any;-;") && !targetId.startsWith("any;+;")) {
         targetId = `any;-;${targetId}`;
@@ -287,14 +311,7 @@ pyWs.on("message", async (raw) => {
 
       const space = await resolveSpace(targetId);
       if (!space) {
-        pyWs.send(
-          JSON.stringify({
-            type: "error",
-            code: "SEND_FAILED",
-            message: "无法解析目标空间: " + targetId,
-            fatal: false,
-          }),
-        );
+        sendResult(false, "无法解析目标空间: " + targetId);
         return;
       }
 
@@ -322,28 +339,19 @@ pyWs.on("message", async (raw) => {
       }
 
       if (contents.length === 0) {
-        pyWs.send(
-          JSON.stringify({
-            type: "error",
-            code: "SEND_FAILED",
-            message: "没有可发送的内容",
-            fatal: false,
-          }),
-        );
+        sendResult(false, "没有可发送的内容");
         return;
       }
 
-      await (space as any).send(...contents);
+      const sent = await (space as any).send(...contents);
+      const sentItems = Array.isArray(sent) ? sent : [sent];
+      const externalMessageId = sentItems
+        .map((item: any) => typeof item?.id === "string" ? item.id : "")
+        .find((id: string) => id.length > 0) ?? "";
+      sendResult(true, "", externalMessageId);
     } catch (err) {
       console.error("[sidecar] 发送消息失败:", err);
-      pyWs.send(
-        JSON.stringify({
-          type: "error",
-          code: "SEND_FAILED",
-          message: String(err),
-          fatal: false,
-        }),
-      );
+      sendResult(false, String(err) || "Photon 发送失败");
     }
   } else if (msg.type === "shutdown") {
     console.log("[sidecar] 收到 Python shutdown 请求，正在关闭…");
