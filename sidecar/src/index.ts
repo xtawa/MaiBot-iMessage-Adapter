@@ -332,7 +332,7 @@ async function collectInboundContent(
             },
             text: textContent,
             timestamp: message.timestamp?.getTime() ?? Date.now(),
-            is_from_me: message.direction === "outbound",
+            is_from_me: false,
             attachments,
           },
         }),
