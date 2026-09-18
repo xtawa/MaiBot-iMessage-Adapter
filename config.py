@@ -8,7 +8,7 @@ from maibot_sdk import Field, PluginConfigBase
 
 SUPPORTED_CONFIG_VERSION = "1.0.0"
 # 供插件作者方便追踪插件版本
-PLUGIN_VERSION = "0.1.9"
+PLUGIN_VERSION = "0.1.10"
 
 DEFAULT_WS_PORT = 18763
 DEFAULT_MAX_RETRIES = 3
@@ -86,7 +86,7 @@ class IMessagePluginOptions(PluginConfigBase):
     )
     plugin_version: str = Field(
         default=PLUGIN_VERSION,
-        description="当前插件版本，用于跟踪插件升级。",
+        description="插件版本标识（兼容旧配置；侧车构建版本不再写回 config.toml）。",
         json_schema_extra={
             "disabled": True,
             "hidden": True,
