@@ -137,6 +137,133 @@ let currentSpace: Awaited<ReturnType<typeof Spectrum>>["messages"] extends Async
 // 缓存已见过的 space（按 id），支持冷发送到之前会话中出现过的 chat_id
 const spaceCache = new Map<string, typeof currentSpace>();
 
+async function collectInboundContent(
+  content: any,
+  senderId: string,
+  textParts: string[],
+  attachments: Record<string, unknown>[],
+): Promise<boolean> {
+  if (!content || typeof content.type !== "string") {
+    return false;
+  }
+
+  switch (content.type) {
+    case "text":
+      if (typeof content.text === "string" && content.text.length > 0) {
+        textParts.push(content.text);
+        return true;
+      }
+      return false;
+
+    case "attachment": {
+      const mime = String(content.mimeType ?? "");
+      const cname = String(content.name ?? "");
+
+      // Photon 当前仍可能把原生 iMessage 语音作为 octet-stream + .caf 暴露。
+      if (mime.startsWith("audio/") || cname.toLowerCase().endsWith(".caf")) {
+        console.log(
+          "[sidecar] 收到音频附件，当前 MaiBot 适配层不处理，已跳过该部分（发送者: %s）",
+          senderId,
+        );
+        return false;
+      }
+
+      if (
+        mime === "image/heic" ||
+        mime === "image/heif" ||
+        cname.toLowerCase().endsWith(".heic") ||
+        cname.toLowerCase().endsWith(".heif")
+      ) {
+        console.log(
+          "[sidecar] 收到 HEIC/HEIF 图片，当前 MaiBot 适配层不处理，已跳过该部分（发送者: %s）",
+          senderId,
+        );
+        return false;
+      }
+
+      try {
+        const buf: Buffer = await content.read();
+        if (buf.length > MAX_ATTACHMENT_BYTES) {
+          console.warn(
+            `[sidecar] 附件超过大小限制，已跳过: ${(buf.length / 1024 / 1024).toFixed(2)} MB > ${Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024)} MB`,
+          );
+          return false;
+        }
+
+        const att: Record<string, unknown> = {
+          type: mime.startsWith("image/") ? "image" : "file",
+          mime_type: mime || "application/octet-stream",
+          data_base64: buf.toString("base64"),
+        };
+        if (cname) att.name = cname;
+        if (content.size != null) att.size = content.size;
+        attachments.push(att);
+        return true;
+      } catch (err) {
+        console.error("[sidecar] 读取附件内容失败:", err);
+        return false;
+      }
+    }
+
+    case "group": {
+      let accepted = false;
+      for (const item of content.items ?? []) {
+        accepted =
+          (await collectInboundContent(
+            item?.content ?? item,
+            senderId,
+            textParts,
+            attachments,
+          )) || accepted;
+      }
+      return accepted;
+    }
+
+    case "reply":
+      // 保留回复正文；target 由 MaiBot 当前 MessageDict 无法完整表达，暂不伪造引用关系。
+      return await collectInboundContent(
+        content.content,
+        senderId,
+        textParts,
+        attachments,
+      );
+
+    case "richlink":
+      if (typeof content.url === "string" && content.url.length > 0) {
+        textParts.push(content.url);
+        return true;
+      }
+      return false;
+
+    case "contact": {
+      const displayName =
+        content.name?.formatted ||
+        [content.name?.first, content.name?.last].filter(Boolean).join(" ");
+      const phones = Array.isArray(content.phones)
+        ? content.phones.map((phone: any) => phone?.value).filter(Boolean)
+        : [];
+      const emails = Array.isArray(content.emails)
+        ? content.emails.map((email: any) => email?.value).filter(Boolean)
+        : [];
+      const details = [displayName, ...phones, ...emails].filter(Boolean).join(" · ");
+      textParts.push(details ? `[联系人] ${details}` : "[联系人名片]");
+      return true;
+    }
+
+    case "voice":
+      console.log(
+        "[sidecar] 收到 voice 内容，当前 MaiBot 适配层不处理，已跳过该部分（发送者: %s）",
+        senderId,
+      );
+      return false;
+
+    // reaction / poll_option / typing / read 等事件不应被当成一次普通用户发言触发 LLM。
+    default:
+      console.log("[sidecar] 忽略不作为普通聊天注入的内容类型: %s", content.type);
+      return false;
+  }
+}
+
 // 启动消息消费循环（异步，不阻塞事件循环）
 (async () => {
   try {
@@ -149,69 +276,20 @@ const spaceCache = new Map<string, typeof currentSpace>();
       currentSpace = space;
       spaceCache.set(space.id, space);
 
-      // Build the uniform message data object
-      let textContent = "";
+      // Spectrum 会把同一条 iMessage 的文字 + 多附件封装为 group，
+      // reply 也可能再包装一层正文，因此递归展开可被 MaiBot 表达的内容。
+      const textParts: string[] = [];
       const attachments: Record<string, unknown>[] = [];
-
-      switch (message.content.type) {
-        case "text":
-          textContent = message.content.text;
-          break;
-        case "attachment": {
-          const mime: string = (message.content as any).mimeType ?? "";
-          const cname: string = (message.content as any).name ?? "";
-
-          // 语音消息：mime=application/octet-stream，文件名 .caf
-          if (mime.startsWith("audio/") || cname.endsWith(".caf")) {
-            console.log(
-              "[sidecar] 收到 CAF 音频格式的信息，MaiBot 不支持处理此类格式的信息，将跳过本条消息（发送者: %s）",
-              message.sender?.id ?? "未知",
-            );
-            continue;
-          }
-
-          // 实况图片：mime=image/heic
-          if (mime === "image/heic" || mime === "image/heif" || cname.endsWith(".heic") || cname.endsWith(".heif")) {
-            console.log(
-              "[sidecar] 收到 HEIC 实况图片格式的信息，MaiBot 不支持处理此类格式的信息，将跳过本条消息（发送者: %s）",
-              message.sender?.id ?? "未知",
-            );
-            continue;
-          }
-          try {
-            const buf: Buffer = await (message.content as any).read();
-            if (buf.length > MAX_ATTACHMENT_BYTES) {
-              console.warn(
-                `[sidecar] 附件超过大小限制，已跳过: ${(buf.length / 1024 / 1024).toFixed(2)} MB > ${Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024)} MB`,
-              );
-              continue;
-            }
-            const att: Record<string, unknown> = {
-              type: mime.startsWith("image/") ? "image" : "file",
-              mime_type: message.content.mimeType,
-              data_base64: buf.toString("base64"),
-            };
-            if (message.content.name) att.name = message.content.name;
-            if ((message.content as any).size != null) att.size = (message.content as any).size;
-            attachments.push(att);
-          } catch (err) {
-            console.error("[sidecar] 读取附件内容失败:", err);
-          }
-          break;
-        }
-        case "voice":
-          console.log(
-            "[sidecar] 收到语音格式的信息，MaiBot 不支持处理此类格式的信息，将跳过本条消息（发送者: %s）",
-            message.sender?.id ?? "未知",
-          );
-          continue; // 不转发给 Python
-        default:
-          console.log(
-            "[sidecar] 收到 %s 格式的信息，MaiBot 不支持处理此类格式的信息，将跳过本条消息",
-            message.content.type,
-          );
-          continue; // 不转发给 Python
+      const accepted = await collectInboundContent(
+        message.content,
+        message.sender?.id ?? "未知",
+        textParts,
+        attachments,
+      );
+      if (!accepted) {
+        continue;
       }
+      const textContent = textParts.join("\n");
 
       pyWs.send(
         JSON.stringify({
