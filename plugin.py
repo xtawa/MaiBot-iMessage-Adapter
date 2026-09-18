@@ -937,7 +937,8 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         del kwargs
 
         self._retry_count = 0
-        await self._restart_sidecar()
+        # 完整停止连接管线会先取消后台 monitor，避免手动重连与自动重启并发。
+        await self._restart_connection_if_needed()
         await self.ctx.send.text("🔄 iMessage 适配器已触发重连", stream_id)
         return True, "已重连", True
 
