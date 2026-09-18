@@ -43,9 +43,11 @@ if (!PROJECT_SECRET) {
 }
 
 const MAX_ATTACHMENT_MB = parseInt(process.env.MAX_ATTACHMENT_SIZE_MB ?? "", 10);
-const MAX_PAYLOAD = (Number.isFinite(MAX_ATTACHMENT_MB) && MAX_ATTACHMENT_MB > 0)
+const MAX_ATTACHMENT_BYTES = (Number.isFinite(MAX_ATTACHMENT_MB) && MAX_ATTACHMENT_MB > 0)
   ? MAX_ATTACHMENT_MB * 1024 * 1024
   : 10 * 1024 * 1024; // fallback 默认 10 MB
+// base64 会把二进制体积放大约 4/3；额外预留 256 KiB 给 JSON 元数据。
+const MAX_PAYLOAD = 4 * Math.ceil(MAX_ATTACHMENT_BYTES / 3) + 256 * 1024;
 
 // ---------------------------------------------------------------------------
 // 2. 初始化 spectrum-ts 官方 SDK
@@ -86,7 +88,7 @@ try {
       pyWs.send(JSON.stringify({ type: "auth", token: TOKEN }));
     });
 
-    pyWs.on("message", (raw) => {
+    pyWs.once("message", (raw) => {
       const msg = JSON.parse(raw.toString());
       if (msg.type === "auth_ok") {
         clearTimeout(timeout);
@@ -165,8 +167,16 @@ const spaceCache = new Map<string, typeof currentSpace>();
           }
           try {
             const buf: Buffer = await (message.content as any).read();
+            if (buf.length > MAX_ATTACHMENT_BYTES) {
+              console.warn(
+                "[sidecar] 附件超过大小限制，已跳过: %.2f MB > %d MB",
+                buf.length / 1024 / 1024,
+                Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024),
+              );
+              continue;
+            }
             const att: Record<string, unknown> = {
-              type: "image",
+              type: mime.startsWith("image/") ? "image" : "file",
               mime_type: message.content.mimeType,
               data_base64: buf.toString("base64"),
             };
@@ -253,7 +263,13 @@ async function resolveSpace(targetId: string): Promise<typeof currentSpace | nul
 }
 
 pyWs.on("message", async (raw) => {
-  const msg = JSON.parse(raw.toString());
+  let msg: any;
+  try {
+    msg = JSON.parse(raw.toString());
+  } catch (err) {
+    console.warn("[sidecar] 收到无效的 Python WebSocket JSON，已忽略:", err);
+    return;
+  }
 
   if (msg.type === "send") {
     try {
