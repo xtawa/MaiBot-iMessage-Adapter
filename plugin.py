@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 _NODEENV_DIR = Path(__file__).parent / ".nodeenv"
 _NODEENV_BIN = "Scripts" if os.name == "nt" else "bin"
 
-_MIN_NODE_MAJOR = 20
+_MIN_NODE_VERSION = (20, 18, 1)
 _WS_FRAME_OVERHEAD_BYTES = 256 * 1024
 _SEND_ACK_TIMEOUT_SECONDS = 30.0
 
@@ -374,8 +374,8 @@ class IMessageAdapterPlugin(MaiBotPlugin):
     ╚══════════════════════════════════════════════"""
 
     @staticmethod
-    async def _detect_node_major(node_path: str) -> int | None:
-        """读取 Node.js 主版本号；无法读取时返回 None。"""
+    async def _detect_node_version(node_path: str) -> tuple[int, int, int] | None:
+        """读取 Node.js 版本；无法读取时返回 None。"""
         try:
             process = await asyncio.create_subprocess_exec(
                 node_path,
@@ -386,10 +386,22 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5.0)
             if process.returncode != 0:
                 return None
-            version = (stdout or b"").decode("utf-8", errors="replace").strip().lstrip("v")
-            return int(version.split(".", 1)[0])
+            raw = (stdout or b"").decode("utf-8", errors="replace").strip().lstrip("v")
+            parts = raw.split("-", 1)[0].split(".")
+            if len(parts) < 3:
+                return None
+            return int(parts[0]), int(parts[1]), int(parts[2])
         except (asyncio.TimeoutError, OSError, ValueError):
             return None
+
+    @staticmethod
+    def _node_version_supported(version: tuple[int, int, int] | None) -> bool:
+        """匹配当前锁定依赖的 Node.js engines：20.18.1+ 或 22+。"""
+        if version is None:
+            return False
+        if version[0] == 20:
+            return version >= _MIN_NODE_VERSION
+        return version[0] >= 22
 
     @staticmethod
     def _node_bin_dir() -> Path:
@@ -419,26 +431,26 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         system_npm = shutil.which("npm")
         system_npx = shutil.which("npx")
         if system_node and system_npm and system_npx:
-            major = await self._detect_node_major(system_node)
-            if major is not None and major >= _MIN_NODE_MAJOR:
+            version = await self._detect_node_version(system_node)
+            if self._node_version_supported(version):
                 return system_node, system_npm, system_npx
+            version_text = ".".join(map(str, version)) if version is not None else "未知"
             self.ctx.logger.warning(
-                "系统 Node.js 版本不可用（检测到主版本 %s，要求 >= %d），将改用隔离 nodeenv",
-                major if major is not None else "未知",
-                _MIN_NODE_MAJOR,
+                "系统 Node.js 版本不可用（检测到 %s，要求 20.18.1+ 或 22+），将改用隔离 nodeenv",
+                version_text,
             )
 
         cached_node = self._nodeenv_node()
         cached_npm = self._nodeenv_npm()
         cached_npx = self._nodeenv_npx()
         if cached_node.exists() and cached_npm.exists() and cached_npx.exists():
-            major = await self._detect_node_major(str(cached_node))
-            if major is not None and major >= _MIN_NODE_MAJOR:
+            version = await self._detect_node_version(str(cached_node))
+            if self._node_version_supported(version):
                 return str(cached_node), str(cached_npm), str(cached_npx)
+            version_text = ".".join(map(str, version)) if version is not None else "未知"
             self.ctx.logger.warning(
-                "缓存的 Node.js 版本不可用（检测到主版本 %s，要求 >= %d），将重新安装",
-                major if major is not None else "未知",
-                _MIN_NODE_MAJOR,
+                "缓存的 Node.js 版本不可用（检测到 %s，要求 20.18.1+ 或 22+），将重新安装",
+                version_text,
             )
 
         if _NODEENV_DIR.exists():
