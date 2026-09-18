@@ -10,10 +10,10 @@
   },
   "license": "GPL-3.0",
   "urls": {
-    "repository": "https://github.com/mayan613/MaiBot-iMessage-Adapter",
-    "homepage": "https://github.com/mayan613/MaiBot-iMessage-Adapter",
+    "repository": "https://github.com/xtawa/MaiBot-iMessage-Adapter",
+    "homepage": "https://github.com/xtawa/MaiBot-iMessage-Adapter",
     "documentation": "https://www.galeros.xyz/2026/07/07/imessage-adapter",
-    "issues": "https://github.com/mayan613/MaiBot-iMessage-Adapter/issues"
+    "issues": "https://github.com/xtawa/MaiBot-iMessage-Adapter/issues"
   },
   "host_application": {
     "min_version": "1.0.0",
