@@ -13,6 +13,7 @@ Made BY Galeros
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import secrets
@@ -481,11 +482,42 @@ class IMessageAdapterPlugin(MaiBotPlugin):
     侧车构建与启动
     ╚══════════════════════════════════════════════"""
 
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        """返回文件 SHA-256；文件不存在或不可读时返回空字符串。"""
+        try:
+            digest = hashlib.sha256()
+            with path.open("rb") as file:
+                for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+        except OSError:
+            return ""
+
     async def _ensure_sidecar_built(self, sidecar_dir: Path) -> bool:
-        """确保侧车编译产物与当前插件版本一致，必要时重新构建。"""
+        """确保侧车依赖与编译产物都和当前仓库状态一致。"""
         dist_dir = sidecar_dir / "dist"
         dist_file = dist_dir / "index.js"
         version_file = dist_dir / ".adapter-version"
+
+        lock_file = sidecar_dir / "package-lock.json"
+        package_file = sidecar_dir / "package.json"
+        dependency_source = lock_file if lock_file.exists() else package_file
+        dependency_hash = self._sha256_file(dependency_source)
+
+        node_modules = sidecar_dir / "node_modules"
+        dependency_marker = node_modules / ".adapter-deps.sha256"
+        installed_dependency_hash = ""
+        if dependency_marker.exists():
+            try:
+                installed_dependency_hash = dependency_marker.read_text(encoding="utf-8").strip()
+            except OSError:
+                installed_dependency_hash = ""
+        dependencies_current = (
+            node_modules.exists()
+            and bool(dependency_hash)
+            and installed_dependency_hash == dependency_hash
+        )
 
         built_version = ""
         if version_file.exists():
@@ -494,14 +526,16 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             except OSError:
                 built_version = ""
 
-        if dist_file.exists() and built_version == PLUGIN_VERSION:
+        build_current = dist_file.exists() and built_version == PLUGIN_VERSION
+        if build_current and dependencies_current:
             return True
 
         if dist_dir.exists():
             self.ctx.logger.warning(
-                "侧车编译产物需要刷新（built=%s current=%s），正在清理 dist",
+                "侧车编译产物需要刷新（built=%s current=%s deps=%s），正在清理 dist",
                 built_version or "unknown",
                 PLUGIN_VERSION,
+                "current" if dependencies_current else "stale",
             )
             await asyncio.to_thread(shutil.rmtree, dist_dir, ignore_errors=True)
 
@@ -511,10 +545,8 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         env = os.environ.copy()
         env["PATH"] = node_bin_dir + os.pathsep + env.get("PATH", "")
 
-        node_modules = sidecar_dir / "node_modules"
-        npm_installed = (node_modules / ".package-lock.json").exists()
-        if not npm_installed:
-            npm_command = "ci" if (sidecar_dir / "package-lock.json").exists() else "install"
+        if not dependencies_current:
+            npm_command = "ci" if lock_file.exists() else "install"
             self.ctx.logger.info("侧车依赖尚未安装，正在执行 npm %s…", npm_command)
             try:
                 process = await asyncio.create_subprocess_exec(
@@ -532,6 +564,13 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                     combined = (out_text + "\n" + err_text).strip()
                     self.ctx.logger.error("npm %s 失败: %s", npm_command, combined)
                     return False
+
+                dependency_hash = self._sha256_file(dependency_source)
+                if dependency_hash:
+                    try:
+                        dependency_marker.write_text(dependency_hash + "\n", encoding="utf-8")
+                    except OSError as exc:
+                        self.ctx.logger.warning("无法写入依赖版本标记 %s: %s", dependency_marker, exc)
             except asyncio.TimeoutError:
                 self.ctx.logger.error("npm %s 超时", npm_command)
                 return False
