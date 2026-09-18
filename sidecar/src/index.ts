@@ -291,12 +291,20 @@ async function collectInboundContent(
       }
       const textContent = textParts.join("\n");
 
+      let linePhone = "";
+      try {
+        linePhone = String((imessage(space as any) as any).phone ?? "");
+      } catch {
+        // 非 iMessage space 理论上不会出现在本侧车；保持空值即可。
+      }
+
       pyWs.send(
         JSON.stringify({
           type: "message",
           data: {
             message_id: message.id,
             chat_id: space.id,
+            line_phone: linePhone,
             sender: {
               name: message.sender?.id ?? "未知",
               address: message.sender?.id ?? "",
@@ -332,17 +340,27 @@ async function collectInboundContent(
 // 5. 接收 Python 指令
 // ---------------------------------------------------------------------------
 
-async function resolveSpace(targetId: string): Promise<typeof currentSpace | null> {
+async function resolveSpace(
+  targetId: string,
+  linePhone = "",
+): Promise<typeof currentSpace | null> {
   if (currentSpace && currentSpace.id === targetId) {
     return currentSpace;
   }
   if (spaceCache.has(targetId)) {
     return spaceCache.get(targetId)!;
   }
-  // Cold send
-  console.log("[sidecar] 冷发送到: chat_id=" + targetId);
+
+  // Cold send. Dedicated 多线项目必须把原会话所属 phone 带回 space.get。
+  console.log(
+    "[sidecar] 冷发送到: chat_id=%s line=%s",
+    targetId,
+    linePhone || "auto",
+  );
   const im = imessage(app);
-  const space = await im.space.get(targetId);
+  const space = linePhone && linePhone !== "shared"
+    ? await im.space.get(targetId, { phone: linePhone })
+    : await im.space.get(targetId);
   if (!space) {
     console.warn("[sidecar] im.space.get 返回 null，无法发送到 " + targetId);
     return null;
@@ -387,7 +405,8 @@ pyWs.on("message", async (raw) => {
         targetId = `any;-;${targetId}`;
       }
 
-      const space = await resolveSpace(targetId);
+      const linePhone = String(msg.data?.line_phone ?? "").trim();
+      const space = await resolveSpace(targetId, linePhone);
       if (!space) {
         sendResult(false, "无法解析目标空间: " + targetId);
         return;
