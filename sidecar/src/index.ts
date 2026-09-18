@@ -73,7 +73,11 @@ try {
 const pyWs = new WebSocket(`ws://127.0.0.1:${PORT}`, {
   maxPayload: MAX_PAYLOAD,
 });
-console.log("[sidecar] 连接到 Python WebSocket，最大附件大小: %d MB", Math.round(MAX_PAYLOAD / 1024 / 1024));
+console.log(
+  "[sidecar] 连接到 Python WebSocket，附件上限: %d MB，帧上限: %d MB",
+  Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024),
+  Math.ceil(MAX_PAYLOAD / 1024 / 1024),
+);
 
 // 3a. 认证握手
 try {
@@ -89,13 +93,17 @@ try {
     });
 
     pyWs.once("message", (raw) => {
-      const msg = JSON.parse(raw.toString());
-      if (msg.type === "auth_ok") {
+      try {
+        const msg = JSON.parse(raw.toString());
         clearTimeout(timeout);
-        resolve();
-      } else {
+        if (msg.type === "auth_ok") {
+          resolve();
+        } else {
+          reject(new Error(`收到非预期消息: ${msg.type}`));
+        }
+      } catch (err) {
         clearTimeout(timeout);
-        reject(new Error(`收到非预期消息: ${msg.type}`));
+        reject(new Error(`认证响应不是有效 JSON: ${String(err)}`));
       }
     });
 
@@ -169,9 +177,7 @@ const spaceCache = new Map<string, typeof currentSpace>();
             const buf: Buffer = await (message.content as any).read();
             if (buf.length > MAX_ATTACHMENT_BYTES) {
               console.warn(
-                "[sidecar] 附件超过大小限制，已跳过: %.2f MB > %d MB",
-                buf.length / 1024 / 1024,
-                Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024),
+                `[sidecar] 附件超过大小限制，已跳过: ${(buf.length / 1024 / 1024).toFixed(2)} MB > ${Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024)} MB`,
               );
               continue;
             }
