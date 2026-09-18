@@ -34,6 +34,7 @@ _NODEENV_BIN = "Scripts" if os.name == "nt" else "bin"
 
 _MIN_NODE_MAJOR = 20
 _WS_FRAME_OVERHEAD_BYTES = 256 * 1024
+_SEND_ACK_TIMEOUT_SECONDS = 30.0
 
 
 def _bridge_frame_limit_bytes(max_attachment_size_mb: int) -> int:
@@ -66,12 +67,14 @@ class IMessageAdapterPlugin(MaiBotPlugin):
     _gateway_ready: bool = False
     _bridge_token: str = ""
     _shutting_down: bool = False
+    _pending_sends: dict[str, asyncio.Future] = {}
 
     """═══════════════════════════════════════════════
     生命周期
     ═══════════════════════════════════════════════"""
 
     async def on_load(self) -> None:
+        self._pending_sends = {}
         await self._restart_connection_if_needed()
 
     async def on_unload(self) -> None:
@@ -208,6 +211,19 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             self._ws_server = None
 
         self._bridge_ws = None
+        self._fail_pending_sends("iMessage 连接已关闭")
+
+    def _fail_pending_sends(self, reason: str) -> None:
+        """让所有等待 Photon 回执的发送任务立即失败。"""
+        pending = list(self._pending_sends.values())
+        self._pending_sends.clear()
+        for future in pending:
+            if not future.done():
+                future.set_result({
+                    "success": False,
+                    "error": reason,
+                    "external_message_id": "",
+                })
 
     """=══════════════════════════════════════════════
     WebSocket Server：接收侧车连接与消息
@@ -290,17 +306,35 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
                 elif tp == "message":
                     data = msg.get("data", {})
+                    if bool(data.get("is_from_me", False)):
+                        self.ctx.logger.debug("忽略自身 iMessage 回声: %s", data.get("message_id"))
+                        continue
+
+                    message_id = str(data.get("message_id", "") or "")
                     mai_msg = self._to_mai_message_dict(data)
                     try:
                         accepted = await self.ctx.gateway.route_message(
                             gateway_name="imessage",
                             message=mai_msg,
-                            external_message_id=str(data.get("message_id", "")),
+                            external_message_id=message_id,
+                            dedupe_key=message_id,
                         )
                         if not accepted:
-                            self.ctx.logger.debug("Host 未接收入站消息: %s", data.get("message_id"))
+                            self.ctx.logger.debug("Host 未接收入站消息: %s", message_id)
                     except Exception as exc:
                         self.ctx.logger.error("注入入站消息失败: %s", exc)
+
+                elif tp == "send_result":
+                    request_id = str(msg.get("request_id", "") or "")
+                    future = self._pending_sends.pop(request_id, None)
+                    if future is None:
+                        self.ctx.logger.debug("收到未知或已过期的发送回执: %s", request_id)
+                    elif not future.done():
+                        future.set_result({
+                            "success": bool(msg.get("success", False)),
+                            "error": str(msg.get("error", "") or ""),
+                            "external_message_id": str(msg.get("external_message_id", "") or ""),
+                        })
 
                 elif tp == "error":
                     code = msg.get("code", "UNKNOWN")
@@ -328,6 +362,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             was_ready = self._gateway_ready
             self._bridge_ws = None
             self._gateway_ready = False
+            self._fail_pending_sends("iMessage 侧车连接已断开")
             if was_ready:
                 try:
                     await self.ctx.gateway.update_state("imessage", ready=False)
@@ -811,20 +846,46 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         if not payload_text and not attachments:
             return {"success": False, "error": "缺少消息内容或目标"}
 
+        request_id = secrets.token_hex(16)
+        loop = asyncio.get_running_loop()
+        receipt_future = loop.create_future()
+        self._pending_sends[request_id] = receipt_future
+        bridge_ws = self._bridge_ws
+
         try:
             payload = {
                 "type": "send",
+                "request_id": request_id,
                 "data": {
                     "chat_id": chat_id,
                     "text": payload_text,
                     "attachments": attachments,
                 },
             }
-            await self._bridge_ws.send(json.dumps(payload, ensure_ascii=False))
-            return {"success": True}
+            await bridge_ws.send(json.dumps(payload, ensure_ascii=False))
+            receipt = await asyncio.wait_for(
+                asyncio.shield(receipt_future),
+                timeout=_SEND_ACK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            self.ctx.logger.error("等待 Photon 发送回执超时: request_id=%s", request_id)
+            return {"success": False, "error": "Photon 发送确认超时（30 秒）"}
         except Exception as exc:
             self.ctx.logger.error("发送消息到侧车失败: %s", exc)
-            return {"success": False, "error": str(exc)}
+            return {"success": False, "error": str(exc) or "发送消息到侧车失败"}
+        finally:
+            self._pending_sends.pop(request_id, None)
+
+        if not receipt.get("success", False):
+            error = str(receipt.get("error", "") or "").strip() or "Photon 未提供发送失败原因"
+            self.ctx.logger.error("Photon 发送失败: %s", error)
+            return {"success": False, "error": error}
+
+        result: dict[str, Any] = {"success": True}
+        external_message_id = str(receipt.get("external_message_id", "") or "").strip()
+        if external_message_id:
+            result["external_message_id"] = external_message_id
+        return result
 
     """╔══════════════════════════════════════════════
     管理命令
