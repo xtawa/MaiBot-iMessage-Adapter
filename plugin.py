@@ -476,13 +476,13 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                     out_text = (stdout or b"").decode("utf-8", errors="replace")
                     err_text = (stderr or b"").decode("utf-8", errors="replace")
                     combined = (out_text + "\n" + err_text).strip()
-                    self.ctx.logger.error("npm install 失败: %s", combined)
+                    self.ctx.logger.error("npm %s 失败: %s", npm_command, combined)
                     return False
             except asyncio.TimeoutError:
-                self.ctx.logger.error("npm install 超时")
+                self.ctx.logger.error("npm %s 超时", npm_command)
                 return False
             except Exception as exc:
-                self.ctx.logger.error("npm install 异常: %s", exc)
+                self.ctx.logger.error("npm %s 异常: %s", npm_command, exc)
                 return False
 
         self.ctx.logger.info("正在编译侧车 TypeScript…")
