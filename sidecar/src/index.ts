@@ -46,8 +46,14 @@ const MAX_ATTACHMENT_MB = parseInt(process.env.MAX_ATTACHMENT_SIZE_MB ?? "", 10)
 const MAX_ATTACHMENT_BYTES = (Number.isFinite(MAX_ATTACHMENT_MB) && MAX_ATTACHMENT_MB > 0)
   ? MAX_ATTACHMENT_MB * 1024 * 1024
   : 10 * 1024 * 1024; // fallback 默认 10 MB
-// base64 会把二进制体积放大约 4/3；额外预留 256 KiB 给 JSON 元数据。
-const MAX_PAYLOAD = 4 * Math.ceil(MAX_ATTACHMENT_BYTES / 3) + 256 * 1024;
+
+const MAX_MESSAGE_MB = parseInt(process.env.MAX_MESSAGE_SIZE_MB ?? "", 10);
+const MAX_MESSAGE_BYTES = (Number.isFinite(MAX_MESSAGE_MB) && MAX_MESSAGE_MB > 0)
+  ? MAX_MESSAGE_MB * 1024 * 1024
+  : 20 * 1024 * 1024; // fallback 默认 20 MB
+
+// 整条消息按附件总量限流；base64 会放大约 4/3，并预留 JSON 元数据空间。
+const MAX_PAYLOAD = 4 * Math.ceil(MAX_MESSAGE_BYTES / 3) + 256 * 1024;
 
 // ---------------------------------------------------------------------------
 // 2. 初始化 spectrum-ts 官方 SDK
@@ -74,8 +80,9 @@ const pyWs = new WebSocket(`ws://127.0.0.1:${PORT}`, {
   maxPayload: MAX_PAYLOAD,
 });
 console.log(
-  "[sidecar] 连接到 Python WebSocket，附件上限: %d MB，帧上限: %d MB",
+  "[sidecar] 连接到 Python WebSocket，单附件: %d MB，单消息总附件: %d MB，帧上限: %d MB",
   Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024),
+  Math.round(MAX_MESSAGE_BYTES / 1024 / 1024),
   Math.ceil(MAX_PAYLOAD / 1024 / 1024),
 );
 
@@ -142,6 +149,7 @@ async function collectInboundContent(
   senderId: string,
   textParts: string[],
   attachments: Record<string, unknown>[],
+  budget: { usedBytes: number },
 ): Promise<boolean> {
   if (!content || typeof content.type !== "string") {
     return false;
@@ -190,6 +198,15 @@ async function collectInboundContent(
           return false;
         }
 
+        if (budget.usedBytes + buf.length > MAX_MESSAGE_BYTES) {
+          console.warn(
+            "[sidecar] 跳过附件：单条消息附件总量将超过 %d MB",
+            Math.round(MAX_MESSAGE_BYTES / 1024 / 1024),
+          );
+          return false;
+        }
+        budget.usedBytes += buf.length;
+
         const att: Record<string, unknown> = {
           type: mime.startsWith("image/") ? "image" : "file",
           mime_type: mime || "application/octet-stream",
@@ -214,6 +231,7 @@ async function collectInboundContent(
             senderId,
             textParts,
             attachments,
+            budget,
           )) || accepted;
       }
       return accepted;
@@ -226,6 +244,7 @@ async function collectInboundContent(
         senderId,
         textParts,
         attachments,
+        budget,
       );
 
     case "richlink":
@@ -280,11 +299,13 @@ async function collectInboundContent(
       // reply 也可能再包装一层正文，因此递归展开可被 MaiBot 表达的内容。
       const textParts: string[] = [];
       const attachments: Record<string, unknown>[] = [];
+      const budget = { usedBytes: 0 };
       const accepted = await collectInboundContent(
         message.content,
         message.sender?.id ?? "未知",
         textParts,
         attachments,
+        budget,
       );
       if (!accepted) {
         continue;
