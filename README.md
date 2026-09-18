@@ -61,7 +61,8 @@ MaiBot (plugin.py)  ←─本地 WebSocket─→  Node.js 侧车  ←─spectrum
 | `[bridge]` | `ws_port` | int | 18763 | 本地桥接 WebSocket 端口 |
 | `[bridge]` | `max_retries` | int | 3 | 侧车崩溃最大重启次数 |
 | `[bridge]` | `retry_interval` | float | 3.0 | 重启间隔（秒） |
-| `[bridge]` | `max_attachment_size_mb` | int | 10 | 最大附件大小（MB） |
+| `[bridge]` | `max_attachment_size_mb` | int | 10 | 单个附件大小上限（MB） |
+| `[bridge]` | `max_message_size_mb` | int | 20 | 单条消息内所有附件的总大小上限（MB） |
 
 ### 使用 (MaiBot配置)
 MaiBot Core 仍会用主配置里的 bot 平台账号识别“机器人自己”。因此在启用此插件后，必须在MaiBot配置文件夹下的bot_config.toml中的 `[bot]` 部分中的 `platforms = []` 这个配置项加入以下信息:
@@ -109,7 +110,7 @@ Photon免费的计划不支持电子邮件地址的iMessage !
 
 - **免费版 Photon 不支持电子邮件地址的 iMessage**，仅支持手机号
 - **免费版 Photon 不支持主动发起会话**，必须先由对方通过 iMessage 向 Photon 号码发送首条消息后，才能回复
-- **附件大小**受 WebUI「最大附件大小」配置项控制（默认 10 MB）；桥接层会为 Base64/JSON 膨胀自动预留帧空间
+- **附件大小**受 WebUI「最大附件大小」配置项控制（默认 10 MB）；桥接层会按“单附件 + 单消息附件总量”双重限制，并为 Base64/JSON 膨胀自动预留帧空间
 
 ## 故障排查
 
