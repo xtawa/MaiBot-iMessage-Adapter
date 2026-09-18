@@ -8,7 +8,7 @@ from maibot_sdk import Field, PluginConfigBase
 
 SUPPORTED_CONFIG_VERSION = "1.0.0"
 # 供插件作者方便追踪插件版本
-PLUGIN_VERSION = "0.1.6"
+PLUGIN_VERSION = "0.1.7"
 
 DEFAULT_WS_PORT = 18763
 DEFAULT_MAX_RETRIES = 3
