@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "com.galeros.imessage_adapter",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "name": "iMessage 连接器 / iMessage Adapter",
   "description": "将你的MaiBot通过Photon连接到iMessage，允许通过iMessage发送和接收消息。",
   "author": {
@@ -20,7 +20,7 @@
     "max_version": "1.99.99"
   },
   "sdk": {
-    "min_version": "1.0.0",
+    "min_version": "2.1.0",
     "max_version": "2.99.99"
   },
   "dependencies": [
@@ -33,11 +33,6 @@
       "type": "python_package",
       "name": "websockets",
       "version_spec": ">=16.0"
-    },
-    {
-      "type": "python_package",
-      "name": "tomlkit",
-      "version_spec": ">=0.15.0"
     }
   ],
   "plugin_type": "adapter",
@@ -47,9 +42,16 @@
       "value": "wrench"
     }
   },
-  "capabilities": ["send.text"],
+  "capabilities": [
+    "send.text"
+  ],
   "i18n": {
     "default_locale": "zh-CN",
-    "supported_locales": ["zh-CN", "en-US", "ja_JP", "ko_KR"]
+    "supported_locales": [
+      "zh-CN",
+      "en-US",
+      "ja_JP",
+      "ko_KR"
+    ]
   }
 }
