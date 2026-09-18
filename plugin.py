@@ -311,11 +311,16 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                         continue
 
                     message_id = str(data.get("message_id", "") or "")
+                    line_phone = str(data.get("line_phone", "") or "").strip()
                     mai_msg = self._to_mai_message_dict(data)
+                    route_metadata = None
+                    if line_phone and line_phone != "shared":
+                        route_metadata = {"self_id": line_phone}
                     try:
                         accepted = await self.ctx.gateway.route_message(
                             gateway_name="imessage",
                             message=mai_msg,
+                            route_metadata=route_metadata,
                             external_message_id=message_id,
                             dedupe_key=message_id,
                         )
@@ -774,7 +779,11 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                     "user_id": str(sender.get("address", "unknown")),
                     "user_nickname": str(sender.get("name", "unknown")),
                 },
-                "additional_config": {},
+                "additional_config": (
+                    {"platform_io_account_id": str(data.get("line_phone", "")).strip()}
+                    if str(data.get("line_phone", "")).strip() not in {"", "shared"}
+                    else {}
+                ),
             },
             "raw_message": raw_message,
         }
@@ -789,6 +798,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         platform="imessage",
         protocol="photon",
         description="iMessage 消息收发网关（通过 Photon Spectrum 云端）",
+        timeout_ms=40000,
     )
     async def send_to_imessage(
         self,
@@ -798,7 +808,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         **kwargs: Any,
     ) -> dict[str, Any]:
         """出站入口：将 MaiBot 回复通过侧车发送到 iMessage。"""
-        del route, metadata, kwargs
+        del metadata, kwargs
 
         session_id = str(message.get("session_id", "") or "")
 
@@ -809,6 +819,14 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         additional_config = message_info.get("additional_config", {}) if isinstance(message_info, dict) else {}
         target_user_id = str(additional_config.get("platform_io_target_user_id", "") or "").strip()
         chat_id = target_user_id if target_user_id else session_id
+
+        route_account_id = ""
+        if isinstance(route, dict):
+            route_account_id = str(route.get("account_id", "") or "").strip()
+        inherited_account_id = str(additional_config.get("platform_io_account_id", "") or "").strip()
+        line_phone = route_account_id or inherited_account_id
+        if line_phone == "shared":
+            line_phone = ""
 
         if self._bridge_ws is None or not self._gateway_ready:
             return {"success": False, "error": "iMessage 网关未就绪"}
@@ -870,6 +888,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                 "request_id": request_id,
                 "data": {
                     "chat_id": chat_id,
+                    "line_phone": line_phone,
                     "text": payload_text,
                     "attachments": attachments,
                 },
