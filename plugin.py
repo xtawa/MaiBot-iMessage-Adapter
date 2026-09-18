@@ -32,6 +32,25 @@ if TYPE_CHECKING:
 _NODEENV_DIR = Path(__file__).parent / ".nodeenv"
 _NODEENV_BIN = "Scripts" if os.name == "nt" else "bin"
 
+_MIN_NODE_MAJOR = 20
+_WS_FRAME_OVERHEAD_BYTES = 256 * 1024
+
+
+def _bridge_frame_limit_bytes(max_attachment_size_mb: int) -> int:
+    """Return a WebSocket frame limit large enough for a base64 attachment."""
+    attachment_bytes = max(1, max_attachment_size_mb) * 1024 * 1024
+    base64_bytes = 4 * ((attachment_bytes + 2) // 3)
+    return base64_bytes + _WS_FRAME_OVERHEAD_BYTES
+
+
+def _base64_decoded_size(encoded: str) -> int:
+    """Estimate decoded byte size without allocating another copy."""
+    value = encoded.strip()
+    if not value:
+        return 0
+    padding = 2 if value.endswith("==") else 1 if value.endswith("=") else 0
+    return max(0, (len(value) * 3) // 4 - padding)
+
 
 class IMessageAdapterPlugin(MaiBotPlugin):
     """iMessage 消息网关适配器插件。"""
@@ -233,15 +252,16 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
             await self._recv_loop(websocket)
 
-        max_bytes = self.config.bridge.max_attachment_size_mb * 1024 * 1024
+        max_frame_bytes = _bridge_frame_limit_bytes(self.config.bridge.max_attachment_size_mb)
         server = await websockets.serve(
             ws_handler, "127.0.0.1", port,
-            max_size=max_bytes,
+            max_size=max_frame_bytes,
         )
         self.ctx.logger.info(
-            "WebSocket Server 已启动: 127.0.0.1:%d，最大附件大小: %d MB",
+            "WebSocket Server 已启动: 127.0.0.1:%d，最大附件大小: %d MB，帧上限: %.1f MB",
             port,
             self.config.bridge.max_attachment_size_mb,
+            max_frame_bytes / 1024 / 1024,
         )
         return server
 
@@ -305,12 +325,36 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         except Exception as exc:
             self.ctx.logger.error("_recv_loop 异常退出: %s", exc)
         finally:
+            was_ready = self._gateway_ready
             self._bridge_ws = None
             self._gateway_ready = False
+            if was_ready:
+                try:
+                    await self.ctx.gateway.update_state("imessage", ready=False)
+                except Exception as exc:
+                    self.ctx.logger.warning("同步 iMessage 网关离线状态失败: %s", exc)
 
     """╔══════════════════════════════════════════════
     Node.js 运行时解析 + 侧车进程管理
     ╚══════════════════════════════════════════════"""
+
+    @staticmethod
+    async def _detect_node_major(node_path: str) -> int | None:
+        """读取 Node.js 主版本号；无法读取时返回 None。"""
+        try:
+            process = await asyncio.create_subprocess_exec(
+                node_path,
+                "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5.0)
+            if process.returncode != 0:
+                return None
+            version = (stdout or b"").decode("utf-8", errors="replace").strip().lstrip("v")
+            return int(version.split(".", 1)[0])
+        except (asyncio.TimeoutError, OSError, ValueError):
+            return None
 
     @staticmethod
     def _node_bin_dir() -> Path:
@@ -338,17 +382,32 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         """
         system_node = shutil.which("node")
         system_npm = shutil.which("npm")
-        if system_node and system_npm:
-            npm_dir = Path(system_npm).parent
-            npx_name = "npx.cmd" if os.name == "nt" else "npx"
-            system_npx = str(npm_dir / npx_name)
-            return system_node, system_npm, system_npx
+        system_npx = shutil.which("npx")
+        if system_node and system_npm and system_npx:
+            major = await self._detect_node_major(system_node)
+            if major is not None and major >= _MIN_NODE_MAJOR:
+                return system_node, system_npm, system_npx
+            self.ctx.logger.warning(
+                "系统 Node.js 版本不可用（检测到主版本 %s，要求 >= %d），将改用隔离 nodeenv",
+                major if major is not None else "未知",
+                _MIN_NODE_MAJOR,
+            )
 
         cached_node = self._nodeenv_node()
         cached_npm = self._nodeenv_npm()
         cached_npx = self._nodeenv_npx()
-        if cached_node.exists() and cached_npm.exists():
-            return str(cached_node), str(cached_npm), str(cached_npx)
+        if cached_node.exists() and cached_npm.exists() and cached_npx.exists():
+            major = await self._detect_node_major(str(cached_node))
+            if major is not None and major >= _MIN_NODE_MAJOR:
+                return str(cached_node), str(cached_npm), str(cached_npx)
+            self.ctx.logger.warning(
+                "缓存的 Node.js 版本不可用（检测到主版本 %s，要求 >= %d），将重新安装",
+                major if major is not None else "未知",
+                _MIN_NODE_MAJOR,
+            )
+
+        if _NODEENV_DIR.exists():
+            await asyncio.to_thread(shutil.rmtree, _NODEENV_DIR, ignore_errors=True)
 
         self.ctx.logger.warning("=" * 60)
         self.ctx.logger.warning("⚠ 系统中未找到 Node.js，即将自动下载安装")
@@ -401,11 +460,12 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         node_modules = sidecar_dir / "node_modules"
         npm_installed = (node_modules / ".package-lock.json").exists()
         if not npm_installed:
-            self.ctx.logger.info("侧车依赖尚未安装，正在执行 npm install…")
+            npm_command = "ci" if (sidecar_dir / "package-lock.json").exists() else "install"
+            self.ctx.logger.info("侧车依赖尚未安装，正在执行 npm %s…", npm_command)
             try:
                 process = await asyncio.create_subprocess_exec(
                     npm_path,
-                    "install",
+                    npm_command,
                     cwd=str(sidecar_dir),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -722,8 +782,17 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             if comp_type == "text":
                 payload_text_parts.append(str(component.get("data", "")))
             elif comp_type == "image":
-                b64 = component.get("binary_data_base64", "")
+                b64 = str(component.get("binary_data_base64", "") or "")
                 if b64:
+                    max_attachment_bytes = self.config.bridge.max_attachment_size_mb * 1024 * 1024
+                    decoded_size = _base64_decoded_size(b64)
+                    if decoded_size > max_attachment_bytes:
+                        self.ctx.logger.warning(
+                            "跳过过大的出站图片: %.2f MB > %d MB",
+                            decoded_size / 1024 / 1024,
+                            self.config.bridge.max_attachment_size_mb,
+                        )
+                        continue
                     attachments.append({
                         "type": "image",
                         "mime_type": "image/png",
