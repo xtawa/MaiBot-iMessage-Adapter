@@ -37,10 +37,10 @@ _WS_FRAME_OVERHEAD_BYTES = 256 * 1024
 _SEND_ACK_TIMEOUT_SECONDS = 30.0
 
 
-def _bridge_frame_limit_bytes(max_attachment_size_mb: int) -> int:
-    """Return a WebSocket frame limit large enough for a base64 attachment."""
-    attachment_bytes = max(1, max_attachment_size_mb) * 1024 * 1024
-    base64_bytes = 4 * ((attachment_bytes + 2) // 3)
+def _bridge_frame_limit_bytes(max_message_size_mb: int) -> int:
+    """Return a WebSocket frame limit large enough for one bounded message."""
+    message_bytes = max(1, max_message_size_mb) * 1024 * 1024
+    base64_bytes = 4 * ((message_bytes + 2) // 3)
     return base64_bytes + _WS_FRAME_OVERHEAD_BYTES
 
 
@@ -249,15 +249,16 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
             await self._recv_loop(websocket)
 
-        max_frame_bytes = _bridge_frame_limit_bytes(self.config.bridge.max_attachment_size_mb)
+        max_frame_bytes = _bridge_frame_limit_bytes(self.config.bridge.max_message_size_mb)
         server = await websockets.serve(
             ws_handler, "127.0.0.1", port,
             max_size=max_frame_bytes,
         )
         self.ctx.logger.info(
-            "WebSocket Server 已启动: 127.0.0.1:%d，最大附件大小: %d MB，帧上限: %.1f MB",
+            "WebSocket Server 已启动: 127.0.0.1:%d，单附件: %d MB，单消息总附件: %d MB，帧上限: %.1f MB",
             port,
             self.config.bridge.max_attachment_size_mb,
+            self.config.bridge.max_message_size_mb,
             max_frame_bytes / 1024 / 1024,
         )
         return server
@@ -585,6 +586,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             "PHOTON_PROJECT_ID": self.config.photon.project_id,
             "PHOTON_PROJECT_SECRET": self.config.photon.project_secret,
             "MAX_ATTACHMENT_SIZE_MB": str(self.config.bridge.max_attachment_size_mb),
+            "MAX_MESSAGE_SIZE_MB": str(self.config.bridge.max_message_size_mb),
         }
 
         self._sidecar_process = await asyncio.create_subprocess_exec(
@@ -804,6 +806,9 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
         payload_text_parts: list[str] = []
         attachments: list[dict] = []
+        attachment_bytes_used = 0
+        max_attachment_bytes = self.config.bridge.max_attachment_size_mb * 1024 * 1024
+        max_message_bytes = self.config.bridge.max_message_size_mb * 1024 * 1024
 
         for component in raw_message:
             if not isinstance(component, dict):
@@ -815,7 +820,6 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             elif comp_type == "image":
                 b64 = str(component.get("binary_data_base64", "") or "")
                 if b64:
-                    max_attachment_bytes = self.config.bridge.max_attachment_size_mb * 1024 * 1024
                     decoded_size = _base64_decoded_size(b64)
                     if decoded_size > max_attachment_bytes:
                         self.ctx.logger.warning(
@@ -824,6 +828,13 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                             self.config.bridge.max_attachment_size_mb,
                         )
                         continue
+                    if attachment_bytes_used + decoded_size > max_message_bytes:
+                        self.ctx.logger.warning(
+                            "跳过出站图片：单条消息附件总量将超过 %d MB",
+                            self.config.bridge.max_message_size_mb,
+                        )
+                        continue
+                    attachment_bytes_used += decoded_size
                     attachments.append({
                         "type": "image",
                         "mime_type": "image/png",
