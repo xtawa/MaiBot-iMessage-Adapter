@@ -162,8 +162,10 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         self._shutting_down = True
 
         if self._monitor_task is not None:
-            self._monitor_task.cancel()
+            monitor_task = self._monitor_task
             self._monitor_task = None
+            monitor_task.cancel()
+            await asyncio.gather(monitor_task, return_exceptions=True)
 
         if self._bridge_ws is not None:
             try:
@@ -598,42 +600,45 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             stderr=asyncio.subprocess.PIPE,
         )
 
-        self.ctx.logger.info("侧车进程已启动: PID=%d", self._sidecar_process.pid)
+        process = self._sidecar_process
+        self.ctx.logger.info("侧车进程已启动: PID=%d", process.pid)
 
-        if self._sidecar_process.stdout is not None:
-            asyncio.create_task(self._read_sidecar_stdout())
-        if self._sidecar_process.stderr is not None:
-            asyncio.create_task(self._read_sidecar_stderr())
+        if process.stdout is not None:
+            asyncio.create_task(self._read_sidecar_stdout(process))
+        if process.stderr is not None:
+            asyncio.create_task(self._read_sidecar_stderr(process))
 
-    async def _read_sidecar_stdout(self) -> None:
-        """将侧车 stdout 逐行转发到框架日志。"""
-        if self._sidecar_process is None or self._sidecar_process.stdout is None:
+    async def _read_sidecar_stdout(self, process: asyncio.subprocess.Process) -> None:
+        """将指定侧车进程的 stdout 逐行转发到框架日志。"""
+        if process.stdout is None:
             return
         try:
             while True:
-                line = await self._sidecar_process.stdout.readline()
+                line = await process.stdout.readline()
                 if not line:
                     break
                 text = line.decode("utf-8", errors="replace").rstrip()
                 if text:
-                    self.ctx.logger.info("[侧车] %s", text)
-        except Exception:
-            pass
+                    self.ctx.logger.info("[侧车:%d] %s", process.pid, text)
+        except (asyncio.CancelledError, Exception) as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                raise
 
-    async def _read_sidecar_stderr(self) -> None:
-        """将侧车 stderr 逐行转发到框架日志。"""
-        if self._sidecar_process is None or self._sidecar_process.stderr is None:
+    async def _read_sidecar_stderr(self, process: asyncio.subprocess.Process) -> None:
+        """将指定侧车进程的 stderr 逐行转发到框架日志。"""
+        if process.stderr is None:
             return
         try:
             while True:
-                line = await self._sidecar_process.stderr.readline()
+                line = await process.stderr.readline()
                 if not line:
                     break
                 text = line.decode("utf-8", errors="replace").rstrip()
                 if text:
-                    self.ctx.logger.warning("[侧车] %s", text)
-        except Exception:
-            pass
+                    self.ctx.logger.warning("[侧车:%d] %s", process.pid, text)
+        except (asyncio.CancelledError, Exception) as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                raise
 
     """╔══════════════════════════════════════════════
     侧车容灾：崩溃重启 + 进程监控
@@ -643,7 +648,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         """终止并重新启动侧车进程。"""
         self.ctx.logger.info(
             "正在重启侧车（第 %d/%d 次）…",
-            self._retry_count + 1,
+            self._retry_count,
             self.config.bridge.max_retries,
         )
 
