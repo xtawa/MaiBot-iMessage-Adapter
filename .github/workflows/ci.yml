@@ -34,6 +34,10 @@ jobs:
         working-directory: sidecar
         run: npm ci
 
-      - name: Build sidecar
+      - name: Build sidecar with locked compiler
         working-directory: sidecar
         run: npm run build
+
+      - name: Typecheck with Spectrum-supported TypeScript 6
+        working-directory: sidecar
+        run: npx --yes -p typescript@6.0.3 tsc -p tsconfig.json --noEmit
