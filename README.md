@@ -26,12 +26,12 @@ git clone https://github.com/mayan613/MaiBot-iMessage-Adapter.git
 | 依赖 | 最低版本 | 用途 |
 |------|----------|------|
 | nodeenv (PyPI) | ≥ 1.10.0 | 系统无 Node.js 时自动安装到插件目录下 |
-| Node.js | ≥ 18 | 侧车运行时。插件优先使用系统安装的 Node.js；若未找到，会自动通过 nodeenv 安装到插件目录下的 `.nodeenv/` |
+| Node.js | ≥ 20 | 侧车运行时。插件会校验系统 Node.js 主版本；版本过低或不可用时，会自动通过 nodeenv 安装隔离的 LTS 到插件目录下的 `.nodeenv/` |
 | Photon 账号 | — | iMessage 云端服务，在 [app.photon.codes](https://app.photon.codes) 注册 |
 | MaiBot | ≥ 1.0.0 | 插件宿主 |
 
 
-首次启用时，插件会在插件目录下通过 `nodeenv` 自动提供 Node.js 运行时（若系统已有则跳过），然后自动执行 `npm install` 安装侧车依赖并编译 TypeScript（约 150 个包，可能需要 1-2 分钟）。后续启动将跳过此步骤。
+首次启用时，插件会优先使用满足 Node.js ≥ 20 的系统运行时；若系统版本过低或不可用，则通过 `nodeenv` 自动提供隔离的 LTS。随后会优先执行 `npm ci`（存在 lockfile 时）安装侧车依赖并编译 TypeScript。后续启动在编译产物有效时会跳过此步骤。
 
 
 ## 架构
