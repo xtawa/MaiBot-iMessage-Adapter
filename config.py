@@ -8,12 +8,13 @@ from maibot_sdk import Field, PluginConfigBase
 
 SUPPORTED_CONFIG_VERSION = "1.0.0"
 # 供插件作者方便追踪插件版本
-PLUGIN_VERSION = "0.1.10"
+PLUGIN_VERSION = "0.1.11"
 
 DEFAULT_WS_PORT = 18763
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_INTERVAL = 3.0
 DEFAULT_MAX_ATTACHMENT_SIZE_MB = 10
+DEFAULT_MAX_MESSAGE_SIZE_MB = 20
 
 
 def _schema_i18n(
@@ -227,6 +228,25 @@ class SidecarBridgeConfig(PluginConfigBase):
             "order": 3,
         },
     )
+    max_message_size_mb: int = Field(
+        default=DEFAULT_MAX_MESSAGE_SIZE_MB,
+        description="单条桥接消息允许携带的附件总大小（MB）。多个附件会共享此额度。",
+        json_schema_extra={
+            "hint": "用于限制多图/多附件消息的总内存占用。建议不小于单附件上限，默认 20 MB。",
+            "i18n": _schema_i18n(
+                label_en="Max message attachments (MB)",
+                label_ja="1メッセージの添付合計上限 (MB)",
+                label_ko="메시지당 첨부파일 총 한도(MB)",
+                hint_en="Limits the total decoded attachment bytes carried by one bridged message. Default: 20 MB.",
+                hint_ja="1 件のブリッジメッセージに含める添付ファイルの合計サイズを制限します。既定値: 20 MB。",
+                hint_ko="하나의 브리지 메시지에 포함되는 첨부파일의 총 디코딩 크기를 제한합니다. 기본값: 20MB.",
+            ),
+            "label": "单条消息附件总上限（MB）",
+            "order": 4,
+        },
+    )
+
+
 
 
 class IMessageAdapterConfig(PluginConfigBase):
