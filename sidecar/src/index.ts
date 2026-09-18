@@ -292,6 +292,13 @@ async function collectInboundContent(
         continue;
       }
 
+      try {
+        await message.read();
+        console.log("[sidecar] 已发送 iMessage 已读回执: message_id=%s", message.id);
+      } catch (error) {
+        console.warn("[sidecar] 发送 iMessage 已读回执失败: %s", String(error));
+      }
+
       currentSpace = space;
       spaceCache.set(space.id, space);
 
