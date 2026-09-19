@@ -862,20 +862,21 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
             if comp_type == "text":
                 payload_text_parts.append(str(component.get("data", "")))
-            elif comp_type == "image":
+            # MaiBot 内置表情工具会生成 emoji 组件；iMessage 通过图片附件承载它。
+            elif comp_type in {"image", "emoji"}:
                 b64 = str(component.get("binary_data_base64", "") or "")
                 if b64:
                     decoded_size = _base64_decoded_size(b64)
                     if decoded_size > max_attachment_bytes:
                         self.ctx.logger.warning(
-                            "跳过过大的出站图片: %.2f MB > %d MB",
+                            "跳过过大的出站图片或表情: %.2f MB > %d MB",
                             decoded_size / 1024 / 1024,
                             self.config.bridge.max_attachment_size_mb,
                         )
                         continue
                     if attachment_bytes_used + decoded_size > max_message_bytes:
                         self.ctx.logger.warning(
-                            "跳过出站图片：单条消息附件总量将超过 %d MB",
+                            "跳过出站图片或表情：单条消息附件总量将超过 %d MB",
                             self.config.bridge.max_message_size_mb,
                         )
                         continue
