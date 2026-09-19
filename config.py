@@ -6,9 +6,9 @@ from typing import Any, ClassVar, Dict, Optional
 
 from maibot_sdk import Field, PluginConfigBase
 
-SUPPORTED_CONFIG_VERSION = "1.0.0"
+SUPPORTED_CONFIG_VERSION = "1.1.0"
 # 供插件作者方便追踪插件版本
-PLUGIN_VERSION = "0.1.14"
+PLUGIN_VERSION = "0.1.15"
 
 DEFAULT_WS_PORT = 18763
 DEFAULT_MAX_RETRIES = 3
@@ -72,6 +72,27 @@ class IMessagePluginOptions(PluginConfigBase):
             ),
             "label": "启用适配器",
             "order": 0,
+        },
+    )
+    inbound_reaction_emoji: str = Field(
+        default="❤️",
+        description="收到可注入 MaiBot 的 iMessage 后自动发送的表情反应；留空可关闭。",
+        json_schema_extra={
+            "hint": "默认发送 ❤️。仅对文字、图片等会进入 MaiBot 消息管道的入站消息生效；留空即可关闭。",
+            "i18n": _schema_i18n(
+                label_en="Inbound reaction emoji",
+                label_ja="受信メッセージへのリアクション",
+                label_ko="수신 메시지 반응 이모지",
+                hint_en="Sends this emoji as a reaction after an inbound iMessage is accepted for MaiBot. Leave empty to disable.",
+                hint_ja="MaiBot に受信として取り込まれた iMessage にこの絵文字でリアクションします。空欄で無効化できます。",
+                hint_ko="MaiBot에 수신 메시지로 전달된 iMessage에 이 이모지로 반응합니다. 비워 두면 비활성화됩니다.",
+                placeholder_en="❤️",
+                placeholder_ja="❤️",
+                placeholder_ko="❤️",
+            ),
+            "label": "入站消息表情反应",
+            "order": 1,
+            "placeholder": "❤️",
         },
     )
     config_version: str = Field(

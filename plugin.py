@@ -628,6 +628,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             "PHOTON_PROJECT_SECRET": self.config.photon.project_secret,
             "MAX_ATTACHMENT_SIZE_MB": str(self.config.bridge.max_attachment_size_mb),
             "MAX_MESSAGE_SIZE_MB": str(self.config.bridge.max_message_size_mb),
+            "INBOUND_REACTION_EMOJI": self.config.plugin.inbound_reaction_emoji,
         }
 
         self._sidecar_process = await asyncio.create_subprocess_exec(

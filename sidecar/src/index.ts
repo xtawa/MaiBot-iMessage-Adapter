@@ -10,7 +10,7 @@
  * 
  */
 
-import { Spectrum, text, attachment } from "spectrum-ts";
+import { Spectrum, attachment, reaction, text } from "spectrum-ts";
 import { imessage } from "spectrum-ts/providers/imessage";
 import { WebSocket } from "ws";
 
@@ -54,6 +54,10 @@ const MAX_MESSAGE_BYTES = (Number.isFinite(MAX_MESSAGE_MB) && MAX_MESSAGE_MB > 0
 
 // 整条消息按附件总量限流；base64 会放大约 4/3，并预留 JSON 元数据空间。
 const MAX_PAYLOAD = 4 * Math.ceil(MAX_MESSAGE_BYTES / 3) + 256 * 1024;
+
+// 空字符串会关闭自动反应；保留完整 Emoji 字符串，不限制为固定的 Tapback 集合。
+const INBOUND_REACTION_EMOJI = (process.env.INBOUND_REACTION_EMOJI ?? "").trim();
+const MAX_SPACE_CACHE_ENTRIES = 256;
 
 // ---------------------------------------------------------------------------
 // 2. 初始化 spectrum-ts 官方 SDK
@@ -143,6 +147,49 @@ let currentSpace: Awaited<ReturnType<typeof Spectrum>>["messages"] extends Async
 
 // 缓存已见过的 space（按 id），支持冷发送到之前会话中出现过的 chat_id
 const spaceCache = new Map<string, typeof currentSpace>();
+
+function rememberSpace(space: typeof currentSpace): void {
+  // Map 的插入顺序可作为轻量 LRU 使用，避免长期运行时会话缓存无限增长。
+  spaceCache.delete(space.id);
+  spaceCache.set(space.id, space);
+
+  if (spaceCache.size <= MAX_SPACE_CACHE_ENTRIES) {
+    return;
+  }
+
+  const oldestSpaceId = spaceCache.keys().next().value;
+  if (typeof oldestSpaceId === "string") {
+    spaceCache.delete(oldestSpaceId);
+  }
+}
+
+function decodeOutboundAttachment(dataBase64: unknown): Buffer {
+  if (typeof dataBase64 !== "string") {
+    throw new Error("附件 data_base64 必须是字符串");
+  }
+
+  const encoded = dataBase64.trim();
+  if (!encoded) {
+    throw new Error("附件 data_base64 不能为空");
+  }
+
+  // Buffer.from 会容忍非法 Base64 并静默截断，必须在桥接边界明确拒绝损坏数据。
+  const base64Pattern = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+  if (!base64Pattern.test(encoded)) {
+    throw new Error("附件 data_base64 不是有效 Base64");
+  }
+
+  const buffer = Buffer.from(encoded, "base64");
+  if (buffer.length === 0) {
+    throw new Error("附件解码后为空");
+  }
+  if (buffer.length > MAX_ATTACHMENT_BYTES) {
+    throw new Error(
+      `附件超过单附件大小限制: ${(buffer.length / 1024 / 1024).toFixed(2)} MB > ${Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024)} MB`,
+    );
+  }
+  return buffer;
+}
 
 async function collectInboundContent(
   content: any,
@@ -300,7 +347,7 @@ async function collectInboundContent(
       }
 
       currentSpace = space;
-      spaceCache.set(space.id, space);
+      rememberSpace(space);
 
       // Spectrum 会把同一条 iMessage 的文字 + 多附件封装为 group，
       // reply 也可能再包装一层正文，因此递归展开可被 MaiBot 表达的内容。
@@ -316,6 +363,31 @@ async function collectInboundContent(
       );
       if (!accepted) {
         continue;
+      }
+
+      if (INBOUND_REACTION_EMOJI) {
+        try {
+          const reactionMessage = await space.send(reaction(INBOUND_REACTION_EMOJI, message));
+          if (reactionMessage) {
+            console.log(
+              "[sidecar] 已发送 iMessage 表情反应 %s: message_id=%s",
+              INBOUND_REACTION_EMOJI,
+              message.id,
+            );
+          } else {
+            console.warn(
+              "[sidecar] iMessage 平台未发送表情反应 %s: message_id=%s",
+              INBOUND_REACTION_EMOJI,
+              message.id,
+            );
+          }
+        } catch (error) {
+          console.warn(
+            "[sidecar] 发送 iMessage 表情反应失败: message_id=%s error=%s",
+            message.id,
+            String(error),
+          );
+        }
       }
       const textContent = textParts.join("\n");
 
@@ -376,7 +448,9 @@ async function resolveSpace(
     return currentSpace;
   }
   if (spaceCache.has(targetId)) {
-    return spaceCache.get(targetId)!;
+    const cachedSpace = spaceCache.get(targetId)!;
+    rememberSpace(cachedSpace);
+    return cachedSpace;
   }
 
   // Cold send. Dedicated 多线项目必须把原会话所属 phone 带回 space.get。
@@ -393,7 +467,7 @@ async function resolveSpace(
     console.warn("[sidecar] im.space.get 返回 null，无法发送到 " + targetId);
     return null;
   }
-  spaceCache.set(space.id, space as typeof currentSpace);
+  rememberSpace(space as typeof currentSpace);
   return space as typeof currentSpace;
 }
 
@@ -450,16 +524,35 @@ pyWs.on("message", async (raw) => {
       }
 
       // Attachments (if any)
-      const atts: any[] = msg.data.attachments ?? [];
+      const atts = msg.data.attachments ?? [];
+      if (!Array.isArray(atts)) {
+        sendResult(false, "attachments 必须是数组");
+        return;
+      }
+      let attachmentBytesUsed = 0;
       for (const att of atts) {
+        if (!att || typeof att !== "object") {
+          sendResult(false, "附件必须是对象");
+          return;
+        }
         if (att.type === "voice") {
           console.log("[sidecar] 不支持发送语音消息，已跳过");
           continue;
         }
-        const mimeType = att.mime_type || "application/octet-stream";
-        const buf = Buffer.from(att.data_base64, "base64");
+        const mimeType = typeof att.mime_type === "string" && att.mime_type
+          ? att.mime_type
+          : "application/octet-stream";
+        const buf = decodeOutboundAttachment(att.data_base64);
+        if (attachmentBytesUsed + buf.length > MAX_MESSAGE_BYTES) {
+          sendResult(
+            false,
+            `单条消息附件总量超过限制: ${Math.round(MAX_MESSAGE_BYTES / 1024 / 1024)} MB`,
+          );
+          return;
+        }
+        attachmentBytesUsed += buf.length;
         const opts: Record<string, unknown> = { mimeType };
-        if (att.name) opts.name = att.name;
+        if (typeof att.name === "string" && att.name) opts.name = att.name;
         contents.push(attachment(buf, opts as any));
       }
 

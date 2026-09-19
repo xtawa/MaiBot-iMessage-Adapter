@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "com.galeros.imessage_adapter",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "name": "iMessage 连接器 / iMessage Adapter",
   "description": "将你的MaiBot通过Photon连接到iMessage，允许通过iMessage发送和接收消息。",
   "author": {

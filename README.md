@@ -55,7 +55,8 @@ MaiBot (plugin.py)  ←─本地 WebSocket─→  Node.js 侧车  ←─spectrum
 | 配置节 | 字段 | 类型 | 默认值 | 说明 |
 |--------|------|------|--------|------|
 | `[plugin]` | `enabled` | bool | false | 是否启用适配器 |
-| `[plugin]` | `config_version` | str | 1.0.0 | 配置版本（无需变更） |
+| `[plugin]` | `inbound_reaction_emoji` | str | ❤️ | 入站消息进入 MaiBot 后发送的 iMessage 表情反应；留空关闭 |
+| `[plugin]` | `config_version` | str | 1.1.0 | 配置版本（无需变更） |
 | `[photon]` | `project_id` | str | "" | Photon 项目 ID |
 | `[photon]` | `project_secret` | str | "" | Photon 项目密钥 |
 | `[bridge]` | `ws_port` | int | 18763 | 本地桥接 WebSocket 端口 |
@@ -93,6 +94,7 @@ Photon免费的计划不支持电子邮件地址的iMessage !
 
 - **收消息**：他人通过 iMessage 发给你 → 自动注入 MaiBot 消息管道 → LLM 回复
 - **发消息**：MaiBot 生成的回复 → 自动通过 iMessage 发送
+- **表情反应**：入站消息成功进入 MaiBot 后，默认以 `❤️` 反应原消息；可在 WebUI 修改为任意表情，留空关闭
 
 ## 注意事项
 
@@ -111,6 +113,7 @@ Photon免费的计划不支持电子邮件地址的iMessage !
 - **免费版 Photon 不支持电子邮件地址的 iMessage**，仅支持手机号
 - **免费版 Photon 不支持主动发起会话**，必须先由对方通过 iMessage 向 Photon 号码发送首条消息后，才能回复
 - **附件大小**受 WebUI「最大附件大小」配置项控制（默认 10 MB）；桥接层会按“单附件 + 单消息附件总量”双重限制，并为 Base64/JSON 膨胀自动预留帧空间
+- **附件完整性**：侧车会拒绝损坏的 Base64、超过单附件上限或超过单条消息总上限的出站附件，不会静默截断后发送
 
 ## 故障排查
 
