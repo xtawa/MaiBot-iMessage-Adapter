@@ -561,6 +561,11 @@ pyWs.on("message", async (raw) => {
         return;
       }
 
+      console.log(
+        "[sidecar] 正在发送 iMessage：文字=%d，附件=%d",
+        msgText.length,
+        atts.length,
+      );
       const sent = await (space as any).send(...contents);
       const sentItems = Array.isArray(sent) ? sent : [sent];
       const externalMessageId = sentItems

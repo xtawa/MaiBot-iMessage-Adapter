@@ -884,6 +884,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                     attachments.append({
                         "type": "image",
                         "mime_type": "image/png",
+                        "name": "maibot-emoji.png" if comp_type == "emoji" else "maibot-image.png",
                         "data_base64": b64,
                     })
             elif comp_type == "voice":
