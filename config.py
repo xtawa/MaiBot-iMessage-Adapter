@@ -8,7 +8,7 @@ from maibot_sdk import Field, PluginConfigBase
 
 SUPPORTED_CONFIG_VERSION = "1.2.0"
 # 供插件作者方便追踪插件版本
-PLUGIN_VERSION = "0.1.18"
+PLUGIN_VERSION = "0.2.0"
 
 DEFAULT_WS_PORT = 18763
 DEFAULT_MAX_RETRIES = 3
@@ -93,6 +93,54 @@ class IMessagePluginOptions(PluginConfigBase):
             "label": "入站消息表情反应",
             "order": 1,
             "placeholder": "👀",
+        },
+    )
+    auto_typing_indicator: bool = Field(
+        default=True,
+        description="收到入站 iMessage 消息后自动触发正在输入（Typing Indicator）气泡状态。",
+        json_schema_extra={
+            "hint": "开启后，收到用户消息并在 MaiBot 思考回复期间自动向对方展示 iMessage 输入中指示器。",
+            "i18n": _schema_i18n(
+                label_en="Auto typing indicator",
+                label_ja="自動入力中インジケーター",
+                label_ko="자동 입력 중 표시",
+                hint_en="Automatically shows the iMessage typing indicator while MaiBot prepares a reply.",
+                hint_ja="MaiBot が返信を準備している間、iMessage の入力中インジケーターを自動表示します。",
+                hint_ko="MaiBot이 답장을 준비하는 동안 iMessage 입력 중 표시기를 자동으로 보여줍니다.",
+            ),
+            "label": "自动输入中指示器",
+            "order": 2,
+        },
+    )
+    parse_inline_action_tags: bool = Field(
+        default=True,
+        description="允许在回复文本中使用内联动作标签（如 [effect:烟花]、[react:❤️]、[music:歌名]、[location:地点]、[poll:标题|选项A|选项B] 等）触发原生 iMessage 动作。",
+        json_schema_extra={
+            "hint": "支持人设提示词或 LLM 直接输出内联标签触发屏幕特效、文字动效、音乐卡片、定位、投票、转账卡片等能力。",
+            "i18n": _schema_i18n(
+                label_en="Parse inline action tags",
+                label_ja="インラインアクションタグ解析",
+                label_ko="인라인 액션 태그 파싱",
+                hint_en="Allows inline tags like [effect:fireworks], [react:❤️], [music:...], [location:...] in outbound text to trigger native iMessage actions.",
+                hint_ja="[effect:fireworks] や [react:❤️]、[music:...] などのインラインタグを解析して iMessage ネイティブ機能を発動します。",
+                hint_ko="[effect:fireworks], [react:❤️], [music:...] 등의 인라인 태그를 파싱하여 네이티브 iMessage 기능을 실행합니다.",
+            ),
+            "label": "解析内联动作标签",
+            "order": 3,
+        },
+    )
+    forward_native_events_to_maibot: bool = Field(
+        default=True,
+        description="将 iMessage 原生事件（撤回、编辑、投票、贴纸、已读、群变更、聊天背景变化等）注入 MaiBot 消息流。",
+        json_schema_extra={
+            "hint": "开启后 MaiBot 可感知对方撤回消息、编辑消息、发起或参与投票、贴纸及转账收款等事件。",
+            "i18n": _schema_i18n(
+                label_en="Forward native iMessage events",
+                label_ja="ネイティブイベントを MaiBot に転送",
+                label_ko="네이티브 이벤트를 MaiBot으로 전달",
+            ),
+            "label": "转发原生事件到 MaiBot",
+            "order": 4,
         },
     )
     config_version: str = Field(

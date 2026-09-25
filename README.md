@@ -56,6 +56,9 @@ MaiBot (plugin.py)  ←─本地 WebSocket─→  Node.js 侧车  ←─spectrum
 |--------|------|------|--------|------|
 | `[plugin]` | `enabled` | bool | false | 是否启用适配器 |
 | `[plugin]` | `inbound_reaction_emoji` | str | 👀 | 入站消息进入 MaiBot 后发送的 iMessage 表情反应；留空关闭 |
+| `[plugin]` | `auto_typing_indicator` | bool | true | 收到入站 iMessage 消息后自动展示正在输入（Typing Indicator）气泡状态 |
+| `[plugin]` | `parse_inline_action_tags` | bool | true | 允许在回复文本中使用内联标签（如 `[effect:烟花]`、`[music:歌名]`、`[transfer:520]` 等）触发原生动作 |
+| `[plugin]` | `forward_native_events_to_maibot` | bool | true | 将 iMessage 撤回、编辑、投票、贴纸、已读、群变更、聊天背景变化等原生事件注入 MaiBot |
 | `[plugin]` | `config_version` | str | 1.2.0 | 配置版本（无需变更） |
 | `[photon]` | `project_id` | str | "" | Photon 项目 ID |
 | `[photon]` | `project_secret` | str | "" | Photon 项目密钥 |
@@ -89,90 +92,47 @@ Photon免费的计划不支持电子邮件地址的iMessage !
 
 | 命令 | 说明 |
 |------|------|
-| `/imessage_status` | 查看连接状态、侧车 PID、重启次数 |
+| `/imessage_status` | 查看连接状态、侧车 PID、重启次数及活跃会话缓存 |
 | `/imessage_reconnect` | 手动重连侧车和 Photon |
+| `/imessage_check <手机号或邮箱>` | 检测指定手机号或 Apple ID 邮箱是否开通 iMessage 蓝泡泡 |
+| `/imessage_enroll <邮箱>` | 将指定邮箱注册到 Photon Shared Instance 实例并获取绑定引导 |
 
-### 消息收发
+### MaiBot LLM 原生工具（`@Tool`）
 
-- **收消息**：他人通过 iMessage 发给你 → 自动注入 MaiBot 消息管道 → LLM 回复
-- **发消息**：MaiBot 生成的回复 → 自动通过 iMessage 发送
-- **表情反应**：入站消息成功进入 MaiBot 后，默认以 `👀` 反应原消息；可在 WebUI 修改为任意表情，留空关闭
-- **多媒体顺序**：文本、语音、图片和普通文件按桥接事件中的原始顺序传递；一条消息可包含多个附件
-- **原生事件**：Spectrum 暴露的 Reaction、Poll、Reply 等内容会在 `imessage_event` 消息段中保留结构化 metadata；MaiBot 不认识的已暴露事件会附带可读系统消息
+插件向 MaiBot 的 LLM 规划器注册了 7 个专用 `@Tool`，让麦麦可以在聊天过程中自主决策并调用 iMessage 原生交互：
 
-### iMessage 能力与边界
+| 工具名称 | 功能说明 |
+|----------|----------|
+| `imessage_send_reaction` | 对消息发送或移除 Tapback 点按表情反应（支持 ❤️/👍/👎/😂/‼️/❓ 及任意自定义 Emoji） |
+| `imessage_reply_or_edit_message` | 引用回复指定消息、编辑上一条已发消息、撤回已发消息或执行已读不回 |
+| `imessage_send_effect` | 发送带全屏特效（烟花、激光、气球、五彩纸屑、爱心、流星、聚光灯、回声、欢庆）、气泡特效（震撼、放大、缩小、隐形墨水）或 iOS 18 文字动效（抖动、点头、爆炸、波纹、绽放等）的消息 |
+| `imessage_poll` | 发起 iMessage 原生交互式投票、为现有投票投出一票、或向投票追加新选项 |
+| `imessage_send_card` | 发送音乐卡片（Apple Music / 网易云音乐双源检索）、虚拟转账收款卡片（对方双击点按气泡即可收款变灰）、富链接预览卡片或个人名片 |
+| `imessage_chat_and_group` | 管理 iMessage 群聊或会话（修改群名、拉人/踢人、展示输入中气泡、穿透勿扰模式强制提醒） |
+| `imessage_location_and_check` | 发送 Apple Maps 原生定位卡片、刷新/查询 Find My 实时位置、或检测号码是否支持 iMessage 蓝泡泡 |
+
+### 内联动作标签（Inline Action Tags）
+
+当 `parse_inline_action_tags = true` 时，人设提示词或 LLM 回复中也可以直接使用内联标签触发 iMessage 动作：
+- `[effect:烟花] 新年快乐！`（全屏/气泡特效，支持中英文别名）
+- `[text_effect:爆炸] 太离谱了！`（iOS 18 文字动效）
+- `[react:❤️]`（对最新入站消息发送 Tapback 反应）
+- `[music:周杰伦-晴天]`（自动检索 Apple Music / 网易云音乐并发送带封面的富链接音乐卡片）
+- `[transfer:520:拿去买奶茶]`（发送虚拟转账 MiniApp 卡片，用户点按气泡即可触发收款并自动更新卡片状态）
+- `[location:南宁万象城]` 或 `[location:22.8152,108.3669|万象城]`（发送 Apple Maps 定位卡片）
+- `[poll:今晚吃什么|火锅|烧烤|日料]` / `[vote:A]` / `[poll_add:小龙虾]`（发起投票 / 投票 / 加选项）
+- `[reply:我也觉得]` / `[edit:更正后的文本]` / `[unsend]` / `[leave_on_read]`
+
+### iMessage 能力与增强细节
 
 | 能力 | 适配行为 |
 |------|----------|
-| 文本、图片、普通附件、多附件 | 收发；多段内容按原顺序组成 Spectrum multipart 消息；图片与附件遵守单附件和单消息总大小限制 |
-| 原生语音 | 收到的 CAF/音频附件转为 `voice` 消息段；出站 `send_audio_message` 使用 Spectrum 的语音 builder |
-| 已读与投递状态 | 侧车尝试调用 Photon `message.read()` 并保留 `read_status`；发送回执只表示 Photon 接收请求，不代表对方设备已投递或已读。锁定的 Spectrum provider 未向 `app.messages` 暴露远端 read/delivery receipts |
-| Tapback / Emoji Reaction | 保留入站原始事件；出站 `send_reaction`，以及已有的入站自动 Reaction |
-| Reply 引用回复 | MaiBot `reply` 段可携带目标消息 ID；也可用 `send_reply` Action |
-| Unsend 撤回 | `unsend_message` 先查侧车缓存，必要时向 Photon 查询目标并确认由本账号发送；当前 Spectrum provider 不会把入站 `message.unsent` 事件转成 `app.messages` 消息 |
-| Message Effects | `send_effect` 支持 Spectrum 暴露的气泡和屏幕效果名称，如 `gentle`、`slam`、`confetti`、`fireworks` |
-| Poll | 收到投票创建及投票/撤销投票变化作为结构化事件；支持 `create_poll`、`vote_poll`、`unvote_poll` 和 `add_poll_option`。Spectrum 当前不转发 `optionAdded` 变更事件 |
-| Chat Background | `set_chat_background` 设置图片背景；`clear: true` 清除 |
-| Link Card | `send_link_card` 接受 HTTP(S) URL 并创建链接卡片 |
-| Location Card | `send_location` 发送 Apple Maps 链接卡片，并在 `action_metadata` 标明这是链接降级 |
-| vCard | `send_vcard` 发送联系人卡片 |
-| HEIC / HEIF / Live Photo | HEIC/HEIF 按原格式收发；Live Photo 入站通过 Photon companion stream 保留主图与视频，出站使用 `send_live_photo` 单独发送配对附件 |
-| 手写消息 | `send_handwriting` 可将 MaiBot 提供的 PNG 等静态图片作为附件发送；没有原生手写 API 时会标记静态图片降级 |
-| Digital Touch | 当前锁定的 Spectrum 公共 API 没有发送入口，Action 会返回明确的不支持错误 |
-| 多 Photon Project / 多号码 | 可配置多个 Photon 项目和号码映射；每条入站事件携带项目与线路 metadata，用于出站选路 |
-| 主动消息与会话缓存 | 已知会话优先使用缓存，未缓存时查询 Photon；`open_dm` 可请求创建 DM，是否允许由 Photon 项目和目标地址的权限决定 |
-| 重连、去重与顺序 | 入站事件按到达顺序串行处理并按项目、号码、事件 ID 去重；Photon 流异常会触发侧车重启重连 |
-
-### 结构化 Action
-
-需要调用 iMessage 原生操作时，在网关消息中传入 `imessage_action` 对象，或使用 `raw_message` 中的 `imessage_action` 段。目标会话仍由 `session_id` 或 `platform_io_target_user_id` 指定；多项目场景可通过 `platform_io_project_id` 和 `platform_io_account_id` 选路。
-
-```json
-{
-  "session_id": "any;-;+15550000000",
-  "imessage_action": {
-    "action": "send_reply",
-    "reply_to_message_id": "photon-message-id",
-    "text": "引用回复内容"
-  }
-}
-```
-
-| Action | 主要字段 |
-|--------|----------|
-| `send_reply` | `reply_to_message_id`、`text`、`attachments` |
-| `unsend_message` | `message_id` |
-| `send_reaction` | `target_message_id`、`emoji` |
-| `send_audio_message` | `data_base64`、`mime_type`、`name`、`duration` |
-| `send_live_photo` | `data_base64`、`name`（`.HEIC`/`.HEIF`）、`mime_type`、`companion_data_base64` |
-| `send_effect` | `effect`、`text` 或单个附件；效果名见上表 |
-| `create_poll` | `title`、`options`（字符串数组） |
-| `vote_poll` | `poll_message_id`、`option_id` |
-| `unvote_poll` | `poll_message_id` |
-| `add_poll_option` | `poll_message_id`、`title` |
-| `send_link_card` | `url`（HTTP 或 HTTPS） |
-| `send_location` | `latitude`、`longitude`，可选 `label` 或 `address` |
-| `send_vcard` | `contact` 或 `vcard` 对象 |
-| `set_chat_background` | `data_base64`、`mime_type`；`clear: true` 可清除背景 |
-| `send_handwriting` | `image_base64` 或 `data_base64`，可选 `mime_type`、`name` |
-| `open_dm` | `recipient`，多号码项目还需线路账号 metadata |
-| `send_digital_touch` | 当前 SDK 未公开对应发送 API，会返回明确失败回执 |
-
-Action 名称大小写不敏感；其余字段按 Action 语义校验。Poll 投票和添加选项复用 Spectrum 管理的 Photon 高级客户端，仍沿用同一项目与线路认证。当前未被 SDK 支持的操作会返回失败回执，不会静默伪装成功。
-
-## 注意事项
-
-### 其他限制
-
-- **免费版 Photon 不支持电子邮件地址的 iMessage**，仅支持手机号
-- **主动发起会话**：`open_dm` 会请求 Spectrum 创建会话；Photon 计划、允许列表和 Apple 侧限制仍可能拒绝该操作
-- **附件大小**受 WebUI「最大附件大小」配置项控制（默认 10 MB）；桥接层会按“单附件 + 单消息附件总量”双重限制，并为 Base64/JSON 膨胀自动预留帧空间
-- **附件完整性**：侧车会拒绝损坏的 Base64、超过单附件上限或超过单条消息总上限的出站附件，不会静默截断后发送
-- **回执语义**：Spectrum 发送成功仅表示 Photon 接受了请求。锁定版本没有公开对方设备投递回执流，故 `delivery_confirmed` 保持 `false`
-- **事件覆盖**：锁定版本的 Spectrum provider 不会把入站撤回、编辑、远端 read receipt 和 Poll `optionAdded` 变更转成 `app.messages` 项；侧车只抽象 SDK 实际暴露的原生事件
-- **平台原生能力**：数字触控等操作以 Spectrum 当前公共 API 为准；不支持时会返回明确错误
-
-为遵守参考仓库的许可证，本项目没有复制或移植 Uranus iMessage 的源码；适配实现使用 Spectrum 已公开的接口，并保留 MaiBot Adapter 原有的 Python 插件与 Node.js 侧车架构。
+| 文本、图片、视频、普通附件与文档提取 | 支持单条消息多段图文混排；自动嗅探图片/音视频魔数，并为 `.txt`/`.md`/`.json`/`.csv`/`.docx` 文档提取可读正文摘要注入 MaiBot |
+| 原生语音与 `+faststart` 转码 | 收到的 CAF/M4A 语音转为 `voice` 段；出站语音若系统存在 `ffmpeg` 会自动转码为带 `-movflags +faststart` 与精确时长的 M4A，防止 iOS 语音气泡显示 `0:00` 或消失 |
+| 底层 gRPC 实时事件流订阅 | 侧车除监听 `spectrum-ts` 消息外，还直接订阅底层 `AdvancedIMessage` 的 `messages`、`chats`、`polls`、`groups` 实时 gRPC 事件流，完整捕获入站撤回（含缓存原文回溯）、消息编辑（含修改前后对比）、已读回执、贴纸放置、聊天背景变更、投票选项追加及群成员/群名/群头像变更 |
+| 手写消息、Digital Touch 与 MiniApp 识别 | 入站消息自动调用 `photon.messages.getEmbeddedMedia` 提取 Apple 手写与 Digital Touch 内嵌图像，并解析 Apple Cash、Find My、网易云音乐、QQ 音乐、B 站、小红书等 15+ 种 iMessage 扩展气泡卡片 |
+| 投递状态二次核验 | 出站消息发送 12 秒后自动核验底层投递状态；若发现对方号码未开通 iMessage 或线路掉线会自动向日志与状态流告警 |
+| 附件流断线重试 | 针对 Photon gRPC 大附件下载偶发的 `RST_STREAM` / `CANCELLED` 瞬态异常内置 4 次指数退避重试 |
 
 ## 故障排查
 

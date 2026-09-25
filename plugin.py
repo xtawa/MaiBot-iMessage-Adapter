@@ -22,10 +22,30 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from maibot_sdk import Command, MaiBotPlugin, MessageGateway
-from maibot_sdk.types import MessageGatewayRouteType
+try:
+    from maibot_sdk import Tool
+    from maibot_sdk.types import MessageGatewayRouteType, ToolParameterInfo, ToolParamType
+except ImportError:  # pragma: no cover - fallback for minimal SDK builds
+    from maibot_sdk.types import MessageGatewayRouteType
+
+    def Tool(*args: Any, **kwargs: Any):  # type: ignore[misc]
+        def _decorator(func: Any) -> Any:
+            return func
+        return _decorator
+
+    class ToolParamType:  # type: ignore[no-redef]
+        STRING = "string"
+        INTEGER = "integer"
+        FLOAT = "float"
+        BOOLEAN = "boolean"
+
+    class ToolParameterInfo:  # type: ignore[no-redef]
+        def __init__(self, **kwargs: Any) -> None:
+            self.__dict__.update(kwargs)
 
 from .config import IMessageAdapterConfig, PLUGIN_VERSION
 from .protocol import (
+    extract_inline_imessage_action,
     extract_reply_target,
     extract_structured_action,
     to_mai_message_dict,
@@ -74,6 +94,8 @@ class IMessageAdapterPlugin(MaiBotPlugin):
     _bridge_token: str = ""
     _shutting_down: bool = False
     _pending_sends: dict[str, asyncio.Future] = {}
+    _chat_states: dict[str, dict[str, Any]] = {}
+    _most_recent_chat_id: str = ""
 
     """═══════════════════════════════════════════════
     生命周期
@@ -81,6 +103,8 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
     async def on_load(self) -> None:
         self._pending_sends = {}
+        self._chat_states = {}
+        self._most_recent_chat_id = ""
         await self._restart_connection_if_needed()
 
     async def on_unload(self) -> None:
@@ -337,16 +361,35 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                         self.ctx.logger.debug("忽略自身 iMessage 回声: %s", data.get("message_id"))
                         continue
 
+                    chat_id = str(data.get("chat_id", "") or "").strip()
                     message_id = str(data.get("message_id", "") or "")
                     line_phone = str(data.get("line_phone", "") or "").strip()
-                    mai_msg = self._to_mai_message_dict(data)
                     project_id = str(data.get("project_id", "") or "").strip()
+                    native_event = data.get("native_event")
+                    if chat_id:
+                        state = self._chat_states.setdefault(chat_id, {"chat_id": chat_id})
+                        if line_phone and line_phone != "shared":
+                            state["line_phone"] = line_phone
+                        if project_id:
+                            state["project_id"] = project_id
+                        if tp == "message" and message_id:
+                            state["last_inbound_message_id"] = message_id
+                        if isinstance(native_event, dict) and native_event.get("event_type") == "poll.created" and message_id:
+                            state["latest_poll_message_id"] = message_id
+                        self._most_recent_chat_id = chat_id
+
+                    if tp == "native_event" and not getattr(
+                        self.config.plugin, "forward_native_events_to_maibot", True
+                    ):
+                        self.ctx.logger.info("收到 iMessage 原生事件（已配置跳过转发）: %s", message_id)
+                        continue
+
+                    mai_msg = self._to_mai_message_dict(data)
                     route_metadata: dict[str, str] = {}
                     if line_phone and line_phone != "shared":
                         route_metadata["self_id"] = line_phone
                     if project_id:
                         route_metadata["connection_id"] = project_id
-                    native_event = data.get("native_event")
                     event_id = ""
                     if isinstance(native_event, dict):
                         event_id = str(native_event.get("event_id", "") or "")
@@ -366,6 +409,32 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                         )
                         if not accepted:
                             self.ctx.logger.debug("Host 未接收入站消息: %s", external_id)
+                        elif (
+                            tp == "message"
+                            and chat_id
+                            and getattr(self.config.plugin, "auto_typing_indicator", True)
+                            and self._bridge_ws is not None
+                        ):
+                            try:
+                                await self._bridge_ws.send(
+                                    json.dumps(
+                                        {
+                                            "type": "action",
+                                            "request_id": secrets.token_hex(8),
+                                            "data": {
+                                                "action": "set_typing",
+                                                "chat_id": chat_id,
+                                                "line_phone": line_phone if line_phone != "shared" else "",
+                                                "project_id": project_id,
+                                                "typing": True,
+                                                "duration_ms": 8000,
+                                            },
+                                        },
+                                        ensure_ascii=False,
+                                    )
+                                )
+                            except Exception as typing_exc:
+                                self.ctx.logger.debug("发送输入中状态失败: %s", typing_exc)
                     except Exception as exc:
                         self.ctx.logger.error("注入 iMessage 入站事件失败: %s", exc)
 
@@ -925,7 +994,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                     else:
                         parts.append({"type": "text", "text": emoji_text})
 
-            if comp_type in {"image", "emoji", "voice", "record", "audio", "file"}:
+            if comp_type in {"image", "emoji", "voice", "record", "audio", "video", "file"}:
                 component_data = component.get("data")
                 nested_data = component_data if isinstance(component_data, dict) else {}
                 b64 = str(
@@ -964,20 +1033,47 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
                 is_voice = comp_type in {"voice", "record", "audio"}
                 is_image = comp_type in {"image", "emoji"}
+                is_video = comp_type == "video"
                 mime_type = str(
                     component.get("mime_type")
                     or nested_data.get("mime_type")
-                    or ("audio/mp4" if is_voice else "image/png" if is_image else "application/octet-stream")
+                    or (
+                        "audio/mp4"
+                        if is_voice
+                        else "image/png"
+                        if is_image
+                        else "video/mp4"
+                        if is_video
+                        else "application/octet-stream"
+                    )
                 )
                 is_live_photo = bool(companion_b64) and is_image
                 attachment_index = len(attachments)
                 attachment = {
-                    "type": "live_photo" if is_live_photo else "voice" if is_voice else "image" if is_image else "file",
+                    "type": (
+                        "live_photo"
+                        if is_live_photo
+                        else "voice"
+                        if is_voice
+                        else "image"
+                        if is_image
+                        else "video"
+                        if is_video
+                        else "file"
+                    ),
                     "mime_type": mime_type,
                     "name": str(
                         component.get("name")
                         or nested_data.get("name")
-                        or ("voice.m4a" if is_voice else "maibot-image.png")
+                        or (
+                            "voice.m4a"
+                            if is_voice
+                            else "maibot-image.png"
+                            if is_image
+                            else "video.mp4"
+                            if is_video
+                            else "attachment.bin"
+                        )
                     ),
                     "duration": nested_data.get("duration", component.get("duration")),
                     "data_base64": b64,
@@ -1006,6 +1102,51 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         if not payload_text and not attachments:
             payload_text = str(message.get("processed_plain_text", "") or "")
 
+        chat_state = self._chat_states.get(chat_id, {})
+        if not line_phone and chat_state.get("line_phone"):
+            line_phone = str(chat_state["line_phone"])
+        if not project_id and chat_state.get("project_id"):
+            project_id = str(chat_state["project_id"])
+
+        if (
+            structured_action is None
+            and payload_text
+            and getattr(self.config.plugin, "parse_inline_action_tags", True)
+        ):
+            cleaned_text, inline_action = extract_inline_imessage_action(payload_text)
+            if inline_action is not None:
+                inline_name = str(inline_action.get("action", ""))
+                if inline_name in {"send_reaction", "remove_reaction", "place_sticker"}:
+                    inline_action.setdefault(
+                        "message_id",
+                        str(chat_state.get("last_inbound_message_id", "") or ""),
+                    )
+                elif inline_name == "send_reply":
+                    inline_action.setdefault(
+                        "reply_to_message_id",
+                        str(chat_state.get("last_inbound_message_id", "") or ""),
+                    )
+                elif inline_name in {"edit_message", "unsend_message"}:
+                    inline_action.setdefault(
+                        "message_id",
+                        str(chat_state.get("last_outbound_message_id", "") or ""),
+                    )
+                elif inline_name in {"vote_poll", "add_poll_option"}:
+                    inline_action.setdefault(
+                        "poll_message_id",
+                        str(
+                            chat_state.get("latest_poll_message_id")
+                            or chat_state.get("last_inbound_message_id")
+                            or ""
+                        ),
+                    )
+                structured_action = inline_action
+                action_name = inline_name
+                payload_text = cleaned_text
+                for part in parts:
+                    if part.get("type") == "text":
+                        part["text"] = cleaned_text
+
         reply_target = extract_reply_target(raw_message)
         live_photo_attachments = [
             item for item in attachments if item.get("type") == "live_photo"
@@ -1026,7 +1167,8 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                 action_data.setdefault("parts", parts)
             if action_name == "send_reply" and not action_data.get("reply_to_message_id"):
                 action_data["reply_to_message_id"] = action_data.get(
-                    "target_message_id", action_data.get("message_id", "")
+                    "target_message_id",
+                    action_data.get("message_id", str(chat_state.get("last_inbound_message_id", "") or "")),
                 )
             if action_name == "send_audio_message" and not action_data.get("data_base64"):
                 voice_attachment = next(
@@ -1128,6 +1270,10 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         external_message_id = str(receipt.get("external_message_id", "") or "").strip()
         if external_message_id:
             result["external_message_id"] = external_message_id
+            state = self._chat_states.setdefault(chat_id, {"chat_id": chat_id})
+            state["last_outbound_message_id"] = external_message_id
+            if action_name == "create_poll":
+                state["latest_poll_message_id"] = external_message_id
         delivery_status = receipt.get("delivery_status")
         if isinstance(delivery_status, dict):
             result["delivery_status"] = delivery_status
@@ -1135,6 +1281,539 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         if isinstance(action_metadata, dict):
             result["action_metadata"] = action_metadata
         return result
+
+    """╔══════════════════════════════════════════════
+    内部动作调用辅助与 LLM Tool 组件（供 MaiBot 规划器主动调用）
+    ╚══════════════════════════════════════════════"""
+
+    def _resolve_active_chat_context(self, chat_id: str = "") -> dict[str, str]:
+        """解析当前活跃会话的 chat_id、line_phone 与 project_id。"""
+        resolved_chat = str(chat_id or "").strip() or self._most_recent_chat_id
+        state = self._chat_states.get(resolved_chat, {})
+        return {
+            "chat_id": resolved_chat,
+            "line_phone": str(state.get("line_phone", "") or ""),
+            "project_id": str(state.get("project_id", "") or ""),
+            "last_inbound_message_id": str(state.get("last_inbound_message_id", "") or ""),
+            "last_outbound_message_id": str(state.get("last_outbound_message_id", "") or ""),
+            "latest_poll_message_id": str(state.get("latest_poll_message_id", "") or ""),
+        }
+
+    async def _execute_sidecar_action(
+        self,
+        action_payload: dict[str, Any],
+        chat_id: str = "",
+    ) -> dict[str, Any]:
+        """直接向 Node.js 侧车发送结构化 iMessage 动作并等待执行回执。"""
+        if self._bridge_ws is None or not self._gateway_ready:
+            return {"success": False, "error": "iMessage 网关尚未就绪"}
+        ctx_info = self._resolve_active_chat_context(chat_id)
+        resolved_chat = str(action_payload.get("chat_id", "") or "").strip() or ctx_info["chat_id"]
+        data = {
+            "chat_id": resolved_chat,
+            "line_phone": str(action_payload.get("line_phone", "") or ctx_info["line_phone"]),
+            "project_id": str(action_payload.get("project_id", "") or ctx_info["project_id"]),
+            **action_payload,
+        }
+        request_id = secrets.token_hex(16)
+        loop = asyncio.get_running_loop()
+        receipt_future = loop.create_future()
+        self._pending_sends[request_id] = receipt_future
+        try:
+            await self._bridge_ws.send(
+                json.dumps(
+                    {
+                        "type": "action",
+                        "request_id": request_id,
+                        "data": data,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            receipt = await asyncio.wait_for(
+                asyncio.shield(receipt_future),
+                timeout=_SEND_ACK_TIMEOUT_SECONDS,
+            )
+            if receipt.get("success") and resolved_chat:
+                ext_id = str(receipt.get("external_message_id", "") or "").strip()
+                if ext_id:
+                    st = self._chat_states.setdefault(resolved_chat, {"chat_id": resolved_chat})
+                    st["last_outbound_message_id"] = ext_id
+                    if data.get("action") == "create_poll":
+                        st["latest_poll_message_id"] = ext_id
+            return receipt
+        except asyncio.TimeoutError:
+            return {"success": False, "error": "等待 iMessage 侧车执行超时"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+        finally:
+            self._pending_sends.pop(request_id, None)
+
+    @Tool(
+        "imessage_send_reaction",
+        description="对 iMessage 消息发送或移除点按表情反应（Tapback，支持 love/like/dislike/laugh/emphasize/question 或任意 Emoji 如 ❤️/👍/🔥）",
+        parameters=[
+            ToolParameterInfo(
+                name="reaction",
+                param_type=ToolParamType.STRING,
+                description="要发送的表情反应，例如 ❤️、👍、😂、‼️、❓ 或任意 Emoji",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="message_id",
+                param_type=ToolParamType.STRING,
+                description="目标消息 GUID；留空则默认对当前会话最新收到的消息点按表情",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="remove",
+                param_type=ToolParamType.BOOLEAN,
+                description="是否移除已发送的表情反应（默认 False 为添加反应）",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="chat_id",
+                param_type=ToolParamType.STRING,
+                description="目标会话 ID；留空则使用当前活跃 iMessage 会话",
+                required=False,
+            ),
+        ],
+    )
+    async def tool_send_reaction(
+        self,
+        reaction: str = "❤️",
+        message_id: str = "",
+        remove: bool = False,
+        chat_id: str = "",
+        **kwargs: Any,
+    ) -> str:
+        del kwargs
+        ctx_info = self._resolve_active_chat_context(chat_id)
+        target_msg_id = str(message_id or "").strip() or ctx_info["last_inbound_message_id"]
+        if not target_msg_id:
+            return "未找到可点按表情的目标消息 ID"
+        res = await self._execute_sidecar_action(
+            {
+                "action": "remove_reaction" if remove else "send_reaction",
+                "message_id": target_msg_id,
+                "reaction": reaction,
+            },
+            chat_id=ctx_info["chat_id"],
+        )
+        if not res.get("success"):
+            return f"iMessage 表情反应操作失败: {res.get('error')}"
+        return f"已对消息 {target_msg_id} {'移除' if remove else '发送'}表情反应 {reaction}"
+
+    @Tool(
+        "imessage_reply_or_edit_message",
+        description="在 iMessage 中引用回复某条消息、编辑机器人上一条已发送消息、撤回已发送消息或执行已读不回",
+        parameters=[
+            ToolParameterInfo(
+                name="operation",
+                param_type=ToolParamType.STRING,
+                description="操作类型：reply（引用回复）、edit（编辑已发消息）、unsend（撤回已发消息）、mark_read（仅标记已读）",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="text",
+                param_type=ToolParamType.STRING,
+                description="回复文本或编辑后的新文本（reply/edit 时必填）",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="message_id",
+                param_type=ToolParamType.STRING,
+                description="目标消息 GUID；留空时 reply 默认引用对方最新消息，edit/unsend 默认作用于机器人最后发送的消息",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="chat_id",
+                param_type=ToolParamType.STRING,
+                description="目标会话 ID；留空则使用当前活跃 iMessage 会话",
+                required=False,
+            ),
+        ],
+    )
+    async def tool_reply_or_edit_message(
+        self,
+        operation: str = "reply",
+        text: str = "",
+        message_id: str = "",
+        chat_id: str = "",
+        **kwargs: Any,
+    ) -> str:
+        del kwargs
+        op = str(operation or "reply").strip().lower()
+        ctx_info = self._resolve_active_chat_context(chat_id)
+        if op == "mark_read":
+            res = await self._execute_sidecar_action(
+                {"action": "mark_read"},
+                chat_id=ctx_info["chat_id"],
+            )
+            return "已将当前 iMessage 会话标记为已读" if res.get("success") else f"标记已读失败: {res.get('error')}"
+        if op == "unsend":
+            target = str(message_id or "").strip() or ctx_info["last_outbound_message_id"]
+            if not target:
+                return "未找到可撤回的已发送消息 ID"
+            res = await self._execute_sidecar_action(
+                {"action": "unsend_message", "message_id": target},
+                chat_id=ctx_info["chat_id"],
+            )
+            return f"已撤回 iMessage 消息 {target}" if res.get("success") else f"撤回失败: {res.get('error')}"
+        if op == "edit":
+            target = str(message_id or "").strip() or ctx_info["last_outbound_message_id"]
+            if not target:
+                return "未找到可编辑的已发送消息 ID"
+            res = await self._execute_sidecar_action(
+                {"action": "edit_message", "message_id": target, "text": text},
+                chat_id=ctx_info["chat_id"],
+            )
+            return f"已将消息 {target} 编辑为: {text}" if res.get("success") else f"编辑失败: {res.get('error')}"
+        target = str(message_id or "").strip() or ctx_info["last_inbound_message_id"]
+        if not target:
+            return "未找到可引用回复的目标消息 ID"
+        res = await self._execute_sidecar_action(
+            {"action": "send_reply", "reply_to_message_id": target, "text": text},
+            chat_id=ctx_info["chat_id"],
+        )
+        return f"已引用回复消息 {target}" if res.get("success") else f"引用回复失败: {res.get('error')}"
+
+    @Tool(
+        "imessage_send_effect",
+        description="发送带有 iMessage 全屏特效（fireworks/lasers/balloons/confetti/heart/shooting_star/spotlight/echo/celebration）、气泡特效（slam/loud/gentle/invisible_ink）或 iOS 18 文字动效（shake/nod/explode/ripple/bloom/jitter/big/small）的消息",
+        parameters=[
+            ToolParameterInfo(
+                name="text",
+                param_type=ToolParamType.STRING,
+                description="要发送的消息文本",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="effect",
+                param_type=ToolParamType.STRING,
+                description="全屏特效、气泡特效或文字动效名称（支持英文名或中文名，如 烟花、激光、气球、五彩纸屑、爱心、震撼、隐形墨水、爆炸、抖动）",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="chat_id",
+                param_type=ToolParamType.STRING,
+                description="目标会话 ID；留空则使用当前活跃 iMessage 会话",
+                required=False,
+            ),
+        ],
+    )
+    async def tool_send_effect(
+        self,
+        text: str,
+        effect: str = "fireworks",
+        chat_id: str = "",
+        **kwargs: Any,
+    ) -> str:
+        del kwargs
+        ctx_info = self._resolve_active_chat_context(chat_id)
+        res = await self._execute_sidecar_action(
+            {"action": "send_effect", "text": text, "effect": effect},
+            chat_id=ctx_info["chat_id"],
+        )
+        if not res.get("success"):
+            return f"iMessage 特效消息发送失败: {res.get('error')}"
+        return f"已发送带特效 [{effect}] 的 iMessage 消息: {text}"
+
+    @Tool(
+        "imessage_poll",
+        description="在当前 iMessage 会话中发起原生交互式投票（create）、对现有投票投出一票（vote）或向投票追加新选项（add_option）",
+        parameters=[
+            ToolParameterInfo(
+                name="operation",
+                param_type=ToolParamType.STRING,
+                description="操作类型：create（发起投票）、vote（参与投票）、add_option（追加选项）",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="title_or_option",
+                param_type=ToolParamType.STRING,
+                description="create 时为投票标题；vote 时为要投的选项（如 A、1 或选项文字）；add_option 时为新增的选项文字",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="options_pipe_separated",
+                param_type=ToolParamType.STRING,
+                description="create 时必填，使用竖线 | 分隔的投票选项列表，例如 '火锅|烧烤|日料'",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="poll_message_id",
+                param_type=ToolParamType.STRING,
+                description="目标投票消息 GUID；留空则自动关联当前会话最近的投票",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="chat_id",
+                param_type=ToolParamType.STRING,
+                description="目标会话 ID；留空则使用当前活跃 iMessage 会话",
+                required=False,
+            ),
+        ],
+    )
+    async def tool_poll(
+        self,
+        operation: str = "create",
+        title_or_option: str = "",
+        options_pipe_separated: str = "",
+        poll_message_id: str = "",
+        chat_id: str = "",
+        **kwargs: Any,
+    ) -> str:
+        del kwargs
+        op = str(operation or "create").strip().lower()
+        ctx_info = self._resolve_active_chat_context(chat_id)
+        if op == "create":
+            opts = [item.strip() for item in str(options_pipe_separated or "").split("|") if item.strip()]
+            if len(opts) < 2:
+                return "创建投票至少需要提供 2 个用 | 分隔的选项"
+            res = await self._execute_sidecar_action(
+                {
+                    "action": "create_poll",
+                    "title": title_or_option or "群投票",
+                    "options": [{"title": item} for item in opts],
+                },
+                chat_id=ctx_info["chat_id"],
+            )
+            return f"已发起 iMessage 投票「{title_or_option}」" if res.get("success") else f"创建投票失败: {res.get('error')}"
+        target_poll = str(poll_message_id or "").strip() or ctx_info["latest_poll_message_id"] or ctx_info["last_inbound_message_id"]
+        if op == "add_option":
+            res = await self._execute_sidecar_action(
+                {
+                    "action": "add_poll_option",
+                    "poll_message_id": target_poll,
+                    "option_text": title_or_option,
+                },
+                chat_id=ctx_info["chat_id"],
+            )
+            return f"已向投票追加选项「{title_or_option}」" if res.get("success") else f"追加选项失败: {res.get('error')}"
+        res = await self._execute_sidecar_action(
+            {
+                "action": "vote_poll",
+                "poll_message_id": target_poll,
+                "option_identifier": title_or_option,
+            },
+            chat_id=ctx_info["chat_id"],
+        )
+        return f"已在投票中选择「{title_or_option}」" if res.get("success") else f"投票失败: {res.get('error')}"
+
+    @Tool(
+        "imessage_send_card",
+        description="发送 iMessage 原生卡片：音乐卡片（music，自动检索 Apple Music / 网易云音乐并生成带封面的可点击播放卡片）、虚拟转账卡片（transfer，对方双击/点按气泡即可收款并使卡片变灰）、富链接卡片（link）或个人名片（contact）",
+        parameters=[
+            ToolParameterInfo(
+                name="card_type",
+                param_type=ToolParamType.STRING,
+                description="卡片类型：music（音乐卡片）、transfer（转账收款卡片）、link（富链接预览卡片）、contact（分享个人名片）",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="primary_value",
+                param_type=ToolParamType.STRING,
+                description="music 时为歌名或'歌手-歌名'；transfer 时为金额（如 '520' 或 '$88.88'）；link 时为 URL；contact 时可留空",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="secondary_value",
+                param_type=ToolParamType.STRING,
+                description="music 时为歌手名（可选）；transfer 时为转账备注（如 '请你喝奶茶'）；link 时为卡片标题",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="chat_id",
+                param_type=ToolParamType.STRING,
+                description="目标会话 ID；留空则使用当前活跃 iMessage 会话",
+                required=False,
+            ),
+        ],
+    )
+    async def tool_send_card(
+        self,
+        card_type: str = "music",
+        primary_value: str = "",
+        secondary_value: str = "",
+        chat_id: str = "",
+        **kwargs: Any,
+    ) -> str:
+        del kwargs
+        kind = str(card_type or "music").strip().lower()
+        ctx_info = self._resolve_active_chat_context(chat_id)
+        if kind == "contact":
+            res = await self._execute_sidecar_action(
+                {"action": "share_my_contact"},
+                chat_id=ctx_info["chat_id"],
+            )
+            return "已分享个人名片" if res.get("success") else f"分享名片失败: {res.get('error')}"
+        if kind == "transfer":
+            res = await self._execute_sidecar_action(
+                {
+                    "action": "send_transfer_card",
+                    "amount": primary_value or "88.88",
+                    "note": secondary_value,
+                },
+                chat_id=ctx_info["chat_id"],
+            )
+            return f"已发送 iMessage 转账卡片 {primary_value}" if res.get("success") else f"发送转账卡片失败: {res.get('error')}"
+        if kind == "link":
+            res = await self._execute_sidecar_action(
+                {
+                    "action": "send_link_card",
+                    "url": primary_value,
+                    "title": secondary_value,
+                },
+                chat_id=ctx_info["chat_id"],
+            )
+            return f"已发送富链接卡片 {primary_value}" if res.get("success") else f"发送富链接卡片失败: {res.get('error')}"
+        res = await self._execute_sidecar_action(
+            {
+                "action": "send_music_card",
+                "query": primary_value,
+                "artist": secondary_value,
+            },
+            chat_id=ctx_info["chat_id"],
+        )
+        return f"已发送音乐卡片「{primary_value}」" if res.get("success") else f"发送音乐卡片失败: {res.get('error')}"
+
+    @Tool(
+        "imessage_chat_and_group",
+        description="管理 iMessage 群聊或会话状态：修改群聊名称（rename）、添加群成员（add_participants）、移除群成员（remove_participants）、设置正在输入指示器（typing）或穿透对方勿扰模式强制提醒（notify_silenced）",
+        parameters=[
+            ToolParameterInfo(
+                name="operation",
+                param_type=ToolParamType.STRING,
+                description="操作类型：rename（修改群名）、add_participants（拉人入群）、remove_participants（移出群聊）、typing（展示输入中）、notify_silenced（穿透勿扰强制提醒）",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="value",
+                param_type=ToolParamType.STRING,
+                description="rename 时为新群名；add_participants/remove_participants 时为用逗号分隔的手机号或邮箱",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="chat_id",
+                param_type=ToolParamType.STRING,
+                description="目标会话 ID；留空则使用当前活跃 iMessage 会话",
+                required=False,
+            ),
+        ],
+    )
+    async def tool_chat_and_group(
+        self,
+        operation: str = "rename",
+        value: str = "",
+        chat_id: str = "",
+        **kwargs: Any,
+    ) -> str:
+        del kwargs
+        op = str(operation or "rename").strip().lower()
+        ctx_info = self._resolve_active_chat_context(chat_id)
+        if op == "typing":
+            res = await self._execute_sidecar_action(
+                {"action": "set_typing", "typing": True, "duration_ms": 8000},
+                chat_id=ctx_info["chat_id"],
+            )
+            return "已触发输入中状态" if res.get("success") else f"触发输入中状态失败: {res.get('error')}"
+        if op == "notify_silenced":
+            res = await self._execute_sidecar_action(
+                {"action": "notify_silenced"},
+                chat_id=ctx_info["chat_id"],
+            )
+            return "已发送穿透勿扰模式提醒" if res.get("success") else f"穿透勿扰提醒失败: {res.get('error')}"
+        participants = [item.strip() for item in str(value or "").split(",") if item.strip()]
+        res = await self._execute_sidecar_action(
+            {
+                "action": "manage_group",
+                "operation": op,
+                "name": value,
+                "participants": participants,
+            },
+            chat_id=ctx_info["chat_id"],
+        )
+        return f"群聊操作 [{op}] 已完成" if res.get("success") else f"群聊操作失败: {res.get('error')}"
+
+    @Tool(
+        "imessage_location_and_check",
+        description="发送 Apple Maps 原生定位卡片（send_location）、读取/刷新 Find My 好友实时位置（find_my）或检测号码/邮箱是否开通 iMessage 蓝泡泡（check_availability）",
+        parameters=[
+            ToolParameterInfo(
+                name="operation",
+                param_type=ToolParamType.STRING,
+                description="操作类型：send_location（发送地图定位卡片）、find_my（查询 Find My 实时位置）、check_availability（检测是否支持 iMessage 蓝泡泡）",
+                required=True,
+            ),
+            ToolParameterInfo(
+                name="target_or_place",
+                param_type=ToolParamType.STRING,
+                description="send_location 时为地点名称或 '名称|地址' 或 '纬度,经度'；check_availability 时为手机号或邮箱",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="latitude",
+                param_type=ToolParamType.FLOAT,
+                description="send_location 时的可选纬度（如 22.8152）",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="longitude",
+                param_type=ToolParamType.FLOAT,
+                description="send_location 时的可选经度（如 108.3669）",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="chat_id",
+                param_type=ToolParamType.STRING,
+                description="目标会话 ID；留空则使用当前活跃 iMessage 会话",
+                required=False,
+            ),
+        ],
+    )
+    async def tool_location_and_check(
+        self,
+        operation: str = "send_location",
+        target_or_place: str = "",
+        latitude: float | None = None,
+        longitude: float | None = None,
+        chat_id: str = "",
+        **kwargs: Any,
+    ) -> str:
+        del kwargs
+        op = str(operation or "send_location").strip().lower()
+        ctx_info = self._resolve_active_chat_context(chat_id)
+        if op == "find_my":
+            res = await self._execute_sidecar_action(
+                {"action": "find_my_location", "refresh": True},
+                chat_id=ctx_info["chat_id"],
+            )
+            if not res.get("success"):
+                return f"查询 Find My 位置失败: {res.get('error')}"
+            return f"Find My 位置结果: {json.dumps(res.get('action_metadata') or {}, ensure_ascii=False)}"
+        if op == "check_availability":
+            res = await self._execute_sidecar_action(
+                {"action": "check_imessage_availability", "address": target_or_place},
+                chat_id=ctx_info["chat_id"],
+            )
+            if not res.get("success"):
+                return f"检测 iMessage 可用性失败: {res.get('error')}"
+            return f"iMessage 号码检测结果: {json.dumps(res.get('action_metadata') or {}, ensure_ascii=False)}"
+        place_parts = [item.strip() for item in str(target_or_place or "").split("|") if item.strip()]
+        name = place_parts[0] if place_parts else "位置分享"
+        address = place_parts[1] if len(place_parts) > 1 else name
+        res = await self._execute_sidecar_action(
+            {
+                "action": "send_location",
+                "name": name,
+                "address": address,
+                "latitude": latitude,
+                "longitude": longitude,
+            },
+            chat_id=ctx_info["chat_id"],
+        )
+        return f"已发送 Apple 地图定位卡片「{name}」" if res.get("success") else f"发送定位卡片失败: {res.get('error')}"
 
     """╔══════════════════════════════════════════════
     管理命令
@@ -1160,6 +1839,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             f"重启次数: {self._retry_count}/{self.config.bridge.max_retries}",
             f"桥接端口: {self.config.bridge.ws_port}",
             f"Photon 项目: {self.config.photon.project_id or '未配置'}",
+            f"活跃会话缓存: {len(self._chat_states)} 个",
         ]
         await self.ctx.send.text("\n".join(status_lines), stream_id)
         return True, "状态已显示", True
@@ -1178,6 +1858,62 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         await self._restart_connection_if_needed()
         await self.ctx.send.text("🔄 iMessage 适配器已触发重连", stream_id)
         return True, "已重连", True
+
+    @Command(
+        "imessage_check",
+        description="检测指定手机号或邮箱是否开通 iMessage 蓝泡泡（用法: /imessage_check +8613800138000）",
+        pattern=r"^/imessage_check(?:\s+(.+))?$",
+    )
+    async def handle_check_availability(self, stream_id: str = "", **kwargs: Any) -> tuple:
+        """检测指定号码或邮箱是否支持 iMessage。"""
+        raw_text = str(kwargs.get("raw_text", kwargs.get("text", "")) or "").strip()
+        target = ""
+        if raw_text.startswith("/imessage_check"):
+            target = raw_text[len("/imessage_check") :].strip()
+        if not target:
+            await self.ctx.send.text("用法: `/imessage_check <手机号或Apple ID邮箱>`", stream_id)
+            return True, "缺少参数", True
+        res = await self._execute_sidecar_action(
+            {"action": "check_imessage_availability", "address": target}
+        )
+        if not res.get("success"):
+            await self.ctx.send.text(f"❌ 检测失败: {res.get('error')}", stream_id)
+            return True, "检测失败", True
+        meta = res.get("action_metadata") or {}
+        avail = meta.get("availability") or {}
+        available = avail.get("available")
+        badge = "💙 支持 iMessage (蓝泡泡)" if available is True else "💚 未开通或仅支持 SMS" if available is False else "ℹ️ 已完成查询"
+        await self.ctx.send.text(f"🔍 `{target}` 检测结果: {badge}\n```json\n{json.dumps(avail, ensure_ascii=False, indent=2)}\n```", stream_id)
+        return True, "检测完成", True
+
+    @Command(
+        "imessage_enroll",
+        description="将指定邮箱注册到 Photon Shared Instance 实例（用法: /imessage_enroll user@example.com）",
+        pattern=r"^/imessage_enroll(?:\s+(.+))?$",
+    )
+    async def handle_enroll_shared_user(self, stream_id: str = "", **kwargs: Any) -> tuple:
+        """将用户邮箱注册到 Photon Shared Instance。"""
+        raw_text = str(kwargs.get("raw_text", kwargs.get("text", "")) or "").strip()
+        email = ""
+        if raw_text.startswith("/imessage_enroll"):
+            email = raw_text[len("/imessage_enroll") :].strip()
+        if not email:
+            await self.ctx.send.text("用法: `/imessage_enroll <Apple ID邮箱>`", stream_id)
+            return True, "缺少参数", True
+        res = await self._execute_sidecar_action(
+            {"action": "enroll_shared_user", "email": email}
+        )
+        if not res.get("success"):
+            await self.ctx.send.text(f"❌ Shared Instance 邮箱注册失败: {res.get('error')}", stream_id)
+            return True, "注册失败", True
+        meta = res.get("action_metadata") or {}
+        alias = meta.get("imessage_alias") or ""
+        await self.ctx.send.text(
+            f"✅ 邮箱 `{email}` 已成功注册到 Photon Shared Instance！"
+            + (f"\n请引导用户使用该邮箱向 `{alias}` 发送首条 iMessage 激活会话。" if alias else ""),
+            stream_id,
+        )
+        return True, "注册成功", True
 
 
 def create_plugin() -> IMessageAdapterPlugin:
