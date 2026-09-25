@@ -25,6 +25,11 @@ from maibot_sdk import Command, MaiBotPlugin, MessageGateway
 from maibot_sdk.types import MessageGatewayRouteType
 
 from .config import IMessageAdapterConfig, PLUGIN_VERSION
+from .protocol import (
+    extract_reply_target,
+    extract_structured_action,
+    to_mai_message_dict,
+)
 
 if TYPE_CHECKING:
     from maibot_sdk import PluginConfigBase
@@ -107,6 +112,15 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
         if not self.config.plugin.should_connect():
             self.ctx.logger.info("iMessage 适配器保持空闲状态，因为插件未启用")
+            return
+
+        try:
+            projects = self.config.photon.configured_projects()
+        except (AttributeError, TypeError, ValueError) as exc:
+            self.ctx.logger.error("iMessage Photon 配置无效: %s", exc)
+            return
+        if len(projects) > 20:
+            self.ctx.logger.error("iMessage 最多支持 20 个 Photon 项目")
             return
 
         self._shutting_down = False
@@ -281,16 +295,44 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                 tp = msg.get("type", "")
                 if tp == "ready":
                     self._gateway_ready = True
+                    project_ids = [
+                        str(value).strip()
+                        for value in msg.get("project_ids", [])
+                        if str(value).strip()
+                    ]
+                    failed_project_ids = [
+                        str(value).strip()
+                        for value in msg.get("failed_project_ids", [])
+                        if str(value).strip()
+                    ]
                     await self.ctx.gateway.update_state(
                         "imessage",
                         ready=True,
                         platform="imessage",
-                        metadata={"protocol": "photon"},
+                        metadata={
+                            "protocol": "photon",
+                            "project_ids": project_ids,
+                            "failed_project_ids": failed_project_ids,
+                            "bridge_protocol_version": msg.get("protocol_version"),
+                        },
                     )
-                    self.ctx.logger.info("Photon 已就绪")
+                    self.ctx.logger.info(
+                        "Photon 已就绪：%d 个项目", len(project_ids) or 1
+                    )
+                    if failed_project_ids:
+                        self.ctx.logger.warning(
+                            "部分 Photon 项目未能连接: %s",
+                            ", ".join(failed_project_ids),
+                        )
 
-                elif tp == "message":
+                elif tp in {"message", "native_event"}:
                     data = msg.get("data", {})
+                    if not isinstance(data, dict):
+                        self.ctx.logger.warning("侧车事件 data 不是对象")
+                        continue
+                    data = dict(data)
+                    if tp == "native_event":
+                        data["is_system_event"] = True
                     if bool(data.get("is_from_me", False)):
                         self.ctx.logger.debug("忽略自身 iMessage 回声: %s", data.get("message_id"))
                         continue
@@ -298,21 +340,34 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                     message_id = str(data.get("message_id", "") or "")
                     line_phone = str(data.get("line_phone", "") or "").strip()
                     mai_msg = self._to_mai_message_dict(data)
-                    route_metadata = None
+                    project_id = str(data.get("project_id", "") or "").strip()
+                    route_metadata: dict[str, str] = {}
                     if line_phone and line_phone != "shared":
-                        route_metadata = {"self_id": line_phone}
+                        route_metadata["self_id"] = line_phone
+                    if project_id:
+                        route_metadata["connection_id"] = project_id
+                    native_event = data.get("native_event")
+                    event_id = ""
+                    if isinstance(native_event, dict):
+                        event_id = str(native_event.get("event_id", "") or "")
+                    external_id = event_id or message_id
+                    dedupe_key = json.dumps(
+                        [project_id, line_phone, external_id],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
                     try:
                         accepted = await self.ctx.gateway.route_message(
                             gateway_name="imessage",
                             message=mai_msg,
-                            route_metadata=route_metadata,
-                            external_message_id=message_id,
-                            dedupe_key=message_id,
+                            route_metadata=route_metadata or None,
+                            external_message_id=external_id,
+                            dedupe_key=dedupe_key,
                         )
                         if not accepted:
-                            self.ctx.logger.debug("Host 未接收入站消息: %s", message_id)
+                            self.ctx.logger.debug("Host 未接收入站消息: %s", external_id)
                     except Exception as exc:
-                        self.ctx.logger.error("注入入站消息失败: %s", exc)
+                        self.ctx.logger.error("注入 iMessage 入站事件失败: %s", exc)
 
                 elif tp == "send_result":
                     request_id = str(msg.get("request_id", "") or "")
@@ -324,6 +379,8 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                             "success": bool(msg.get("success", False)),
                             "error": str(msg.get("error", "") or ""),
                             "external_message_id": str(msg.get("external_message_id", "") or ""),
+                            "delivery_status": msg.get("delivery_status"),
+                            "action_metadata": msg.get("action_metadata"),
                         })
 
                 elif tp == "error":
@@ -626,6 +683,9 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             "BRIDGE_WS_TOKEN": self._bridge_token,
             "PHOTON_PROJECT_ID": self.config.photon.project_id,
             "PHOTON_PROJECT_SECRET": self.config.photon.project_secret,
+            "PHOTON_PROJECTS": json.dumps(
+                self.config.photon.configured_projects(), ensure_ascii=False
+            ),
             "MAX_ATTACHMENT_SIZE_MB": str(self.config.bridge.max_attachment_size_mb),
             "MAX_MESSAGE_SIZE_MB": str(self.config.bridge.max_message_size_mb),
             "INBOUND_REACTION_EMOJI": self.config.plugin.inbound_reaction_emoji,
@@ -756,50 +816,8 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
     @staticmethod
     def _to_mai_message_dict(data: dict) -> dict:
-        """将侧车 JSON 转换为 MaiBot 标准的入站消息字典。"""
-        sender = data.get("sender", {})
-        chat_id = str(data.get("chat_id", ""))
-        text = str(data.get("text", "") or "")
-
-        raw_message: list[dict] = []
-
-        if text:
-            raw_message.append({"type": "text", "data": text})
-
-        for att in data.get("attachments", []) or []:
-            att_type = str(att.get("type", "")).strip().lower()
-            data_base64 = att.get("data_base64", "")
-
-            if att_type == "image":
-                raw_message.append({
-                    "type": "image",
-                    "data": "",
-                    "binary_data_base64": data_base64,
-                    "hash": "",
-                })
-            else:
-                raw_message.append({"type": "dict", "data": att})
-
-        if not raw_message:
-            raw_message = [{"type": "text", "data": ""}]
-
-        return {
-            "message_id": data.get("message_id", ""),
-            "platform": "imessage",
-            "session_id": chat_id,
-            "message_info": {
-                "user_info": {
-                    "user_id": str(sender.get("address", "unknown")),
-                    "user_nickname": str(sender.get("name", "unknown")),
-                },
-                "additional_config": (
-                    {"platform_io_account_id": str(data.get("line_phone", "")).strip()}
-                    if str(data.get("line_phone", "")).strip() not in {"", "shared"}
-                    else {}
-                ),
-            },
-            "raw_message": raw_message,
-        }
+        """将 Sidecar 事件完整转换为 MaiBot 标准消息结构。"""
+        return to_mai_message_dict(data)
 
     """╔══════════════════════════════════════════════
     出站：MaiBot → iMessage
@@ -823,34 +841,58 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         """出站入口：将 MaiBot 回复通过侧车发送到 iMessage。"""
         del metadata, kwargs
 
-        session_id = str(message.get("session_id", "") or "")
-
-        if not session_id:
-            return {"success": False, "error": "缺少目标会话"}
-
         message_info = message.get("message_info", {})
-        additional_config = message_info.get("additional_config", {}) if isinstance(message_info, dict) else {}
-        target_user_id = str(additional_config.get("platform_io_target_user_id", "") or "").strip()
-        chat_id = target_user_id if target_user_id else session_id
+        additional_config = (
+            message_info.get("additional_config", {})
+            if isinstance(message_info, dict)
+            else {}
+        )
+        if not isinstance(additional_config, dict):
+            additional_config = {}
+        raw_message = message.get("raw_message", [])
+        if not isinstance(raw_message, list):
+            raw_message = []
+        try:
+            structured_action = extract_structured_action(message)
+        except ValueError as exc:
+            return {"success": False, "error": str(exc)}
+
+        session_id = str(message.get("session_id", "") or "").strip()
+        target_user_id = str(
+            additional_config.get("platform_io_target_user_id", "") or ""
+        ).strip()
+        chat_id = target_user_id or session_id
+        action_name = str((structured_action or {}).get("action", ""))
+        if not chat_id and action_name == "open_dm":
+            chat_id = str((structured_action or {}).get("recipient", "") or "").strip()
+        if not chat_id:
+            return {"success": False, "error": "缺少目标会话或收件人"}
 
         route_account_id = ""
+        route_project_id = ""
         if isinstance(route, dict):
-            route_account_id = str(route.get("account_id", "") or "").strip()
-        inherited_account_id = str(additional_config.get("platform_io_account_id", "") or "").strip()
+            route_account_id = str(
+                route.get("account_id", route.get("self_id", "")) or ""
+            ).strip()
+            route_project_id = str(
+                route.get("connection_id", route.get("project_id", "")) or ""
+            ).strip()
+        inherited_account_id = str(
+            additional_config.get("platform_io_account_id", "") or ""
+        ).strip()
         line_phone = route_account_id or inherited_account_id
         if line_phone == "shared":
             line_phone = ""
+        project_id = route_project_id or str(
+            additional_config.get("platform_io_project_id", "") or ""
+        ).strip()
 
         if self._bridge_ws is None or not self._gateway_ready:
             return {"success": False, "error": "iMessage 网关未就绪"}
 
-        # Build text and attachments from raw_message
-        raw_message = message.get("raw_message", [])
-        if not isinstance(raw_message, list):
-            raw_message = []
-
         payload_text_parts: list[str] = []
-        attachments: list[dict] = []
+        attachments: list[dict[str, Any]] = []
+        parts: list[dict[str, Any]] = []
         attachment_bytes_used = 0
         max_attachment_bytes = self.config.bridge.max_attachment_size_mb * 1024 * 1024
         max_message_bytes = self.config.bridge.max_message_size_mb * 1024 * 1024
@@ -859,45 +901,183 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             if not isinstance(component, dict):
                 continue
             comp_type = str(component.get("type", "")).strip().lower()
-
             if comp_type == "text":
-                payload_text_parts.append(str(component.get("data", "")))
-            # MaiBot 内置表情工具会生成 emoji 组件；iMessage 通过图片附件承载它。
-            elif comp_type in {"image", "emoji"}:
-                b64 = str(component.get("binary_data_base64", "") or "")
-                if b64:
-                    decoded_size = _base64_decoded_size(b64)
-                    if decoded_size > max_attachment_bytes:
-                        self.ctx.logger.warning(
-                            "跳过过大的出站图片或表情: %.2f MB > %d MB",
-                            decoded_size / 1024 / 1024,
-                            self.config.bridge.max_attachment_size_mb,
-                        )
-                        continue
-                    if attachment_bytes_used + decoded_size > max_message_bytes:
-                        self.ctx.logger.warning(
-                            "跳过出站图片或表情：单条消息附件总量将超过 %d MB",
-                            self.config.bridge.max_message_size_mb,
-                        )
-                        continue
-                    attachment_bytes_used += decoded_size
-                    attachments.append({
-                        "type": "image",
-                        "mime_type": "image/png",
-                        "name": "maibot-emoji.png" if comp_type == "emoji" else "maibot-image.png",
-                        "data_base64": b64,
-                    })
-            elif comp_type == "voice":
-                # 语音不支持（Photon AttachmentService 对 iMessage 语音附件下载有 bug）
-                self.ctx.logger.warning("不支持发送语音消息，已跳过")
+                text_part = str(component.get("data", ""))
+                payload_text_parts.append(text_part)
+                if text_part:
+                    if parts and parts[-1].get("type") == "text":
+                        parts[-1]["text"] += text_part
+                    else:
+                        parts.append({"type": "text", "text": text_part})
+                continue
+            if comp_type in {"imessage_action", "imessage-action", "reply", "quote", "imessage_event"}:
+                continue
+
+            if comp_type == "emoji":
+                component_data = component.get("data")
+                emoji_text = component_data if isinstance(component_data, str) else ""
+                if isinstance(component_data, dict):
+                    emoji_text = str(component_data.get("emoji", component_data.get("name", "")) or "")
+                if emoji_text:
+                    payload_text_parts.append(emoji_text)
+                    if parts and parts[-1].get("type") == "text":
+                        parts[-1]["text"] += emoji_text
+                    else:
+                        parts.append({"type": "text", "text": emoji_text})
+
+            if comp_type in {"image", "emoji", "voice", "record", "audio", "file"}:
+                component_data = component.get("data")
+                nested_data = component_data if isinstance(component_data, dict) else {}
+                b64 = str(
+                    component.get("binary_data_base64")
+                    or nested_data.get("binary_data_base64")
+                    or nested_data.get("data_base64")
+                    or ""
+                )
+                if not b64:
+                    if comp_type in {"voice", "record", "audio"}:
+                        self.ctx.logger.warning("跳过没有音频数据的语音段")
+                    continue
+                decoded_size = _base64_decoded_size(b64)
+                companion_b64 = str(
+                    component.get("live_photo_companion_base64")
+                    or nested_data.get("live_photo_companion_base64")
+                    or nested_data.get("companion_data_base64")
+                    or ""
+                )
+                companion_size = _base64_decoded_size(companion_b64)
+                total_size = decoded_size + companion_size
+                if total_size > max_attachment_bytes:
+                    self.ctx.logger.warning(
+                        "跳过过大的出站附件: %.2f MB > %d MB",
+                        total_size / 1024 / 1024,
+                        self.config.bridge.max_attachment_size_mb,
+                    )
+                    continue
+                if attachment_bytes_used + total_size > max_message_bytes:
+                    self.ctx.logger.warning(
+                        "跳过附件：单条消息附件总量将超过 %d MB",
+                        self.config.bridge.max_message_size_mb,
+                    )
+                    continue
+                attachment_bytes_used += total_size
+
+                is_voice = comp_type in {"voice", "record", "audio"}
+                is_image = comp_type in {"image", "emoji"}
+                mime_type = str(
+                    component.get("mime_type")
+                    or nested_data.get("mime_type")
+                    or ("audio/mp4" if is_voice else "image/png" if is_image else "application/octet-stream")
+                )
+                is_live_photo = bool(companion_b64) and is_image
+                attachment_index = len(attachments)
+                attachment = {
+                    "type": "live_photo" if is_live_photo else "voice" if is_voice else "image" if is_image else "file",
+                    "mime_type": mime_type,
+                    "name": str(
+                        component.get("name")
+                        or nested_data.get("name")
+                        or ("voice.m4a" if is_voice else "maibot-image.png")
+                    ),
+                    "duration": nested_data.get("duration", component.get("duration")),
+                    "data_base64": b64,
+                }
+                if is_live_photo:
+                    attachment["companion_data_base64"] = companion_b64
+                    attachment["companion_name"] = str(
+                        component.get("live_photo_companion_name")
+                        or nested_data.get("live_photo_companion_name")
+                        or nested_data.get("companion_name")
+                        or ""
+                    )
+                    attachment["companion_mime_type"] = str(
+                        component.get("live_photo_companion_mime_type")
+                        or nested_data.get("live_photo_companion_mime_type")
+                        or nested_data.get("companion_mime_type")
+                        or "video/quicktime"
+                    )
+                attachments.append(attachment)
+                parts.append({
+                    "type": "voice" if is_voice else "attachment",
+                    "attachment_index": attachment_index,
+                })
 
         payload_text = "".join(payload_text_parts)
-
-        # Fallback: if raw_message was empty, use legacy processed_plain_text
         if not payload_text and not attachments:
             payload_text = str(message.get("processed_plain_text", "") or "")
 
-        if not payload_text and not attachments:
+        reply_target = extract_reply_target(raw_message)
+        live_photo_attachments = [
+            item for item in attachments if item.get("type") == "live_photo"
+        ]
+        request_type = "send"
+        action_data: dict[str, Any] | None = None
+        if structured_action is not None:
+            if live_photo_attachments and action_name != "send_live_photo":
+                return {
+                    "success": False,
+                    "error": "Live Photo 需要使用 send_live_photo 单独发送，不能与文本或其他附件混合",
+                }
+            request_type = "action"
+            action_data = dict(structured_action)
+            if action_name in {"send", "send_reply", "send_audio_message", "send_effect"}:
+                action_data.setdefault("text", payload_text)
+                action_data.setdefault("attachments", attachments)
+                action_data.setdefault("parts", parts)
+            if action_name == "send_reply" and not action_data.get("reply_to_message_id"):
+                action_data["reply_to_message_id"] = action_data.get(
+                    "target_message_id", action_data.get("message_id", "")
+                )
+            if action_name == "send_audio_message" and not action_data.get("data_base64"):
+                voice_attachment = next(
+                    (item for item in attachments if item.get("type") == "voice"),
+                    None,
+                )
+                if voice_attachment is not None:
+                    action_data.update(voice_attachment)
+            if action_name == "send_live_photo":
+                live_photo = live_photo_attachments[0] if live_photo_attachments else None
+                if live_photo is not None:
+                    action_data.setdefault("data_base64", live_photo["data_base64"])
+                    action_data.setdefault("mime_type", live_photo["mime_type"])
+                    action_data.setdefault("name", live_photo["name"])
+                    action_data.setdefault(
+                        "companion_data_base64", live_photo["companion_data_base64"]
+                    )
+                    action_data.setdefault("companion_name", live_photo.get("companion_name", ""))
+            if action_name == "send_live_photo" and (
+                payload_text or len(live_photo_attachments) > 1 or len(attachments) > 1
+            ):
+                return {
+                    "success": False,
+                    "error": "Live Photo 目前需要单独发送，不能与文本或其他附件混合",
+                }
+        elif live_photo_attachments:
+            if len(live_photo_attachments) != 1 or len(attachments) != 1 or payload_text:
+                return {
+                    "success": False,
+                    "error": "Live Photo 目前需要单独发送，不能与文本或其他附件混合",
+                }
+            live_photo = live_photo_attachments[0]
+            request_type = "action"
+            action_data = {
+                "action": "send_live_photo",
+                "data_base64": live_photo["data_base64"],
+                "mime_type": live_photo["mime_type"],
+                "name": live_photo["name"],
+                "companion_data_base64": live_photo["companion_data_base64"],
+                "companion_name": live_photo.get("companion_name", ""),
+            }
+        elif reply_target:
+            request_type = "action"
+            action_data = {
+                "action": "send_reply",
+                "reply_to_message_id": reply_target,
+                "text": payload_text,
+                "attachments": attachments,
+            }
+
+        if request_type == "send" and not payload_text and not attachments:
             return {"success": False, "error": "缺少消息内容或目标"}
 
         request_id = secrets.token_hex(16)
@@ -908,13 +1088,21 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
         try:
             payload = {
-                "type": "send",
+                "type": request_type,
                 "request_id": request_id,
                 "data": {
                     "chat_id": chat_id,
                     "line_phone": line_phone,
-                    "text": payload_text,
-                    "attachments": attachments,
+                    "project_id": project_id,
+                    **(
+                        action_data
+                        if action_data is not None
+                        else {
+                            "text": payload_text,
+                            "attachments": attachments,
+                            "parts": parts,
+                        }
+                    ),
                 },
             }
             await bridge_ws.send(json.dumps(payload, ensure_ascii=False))
@@ -940,6 +1128,12 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         external_message_id = str(receipt.get("external_message_id", "") or "").strip()
         if external_message_id:
             result["external_message_id"] = external_message_id
+        delivery_status = receipt.get("delivery_status")
+        if isinstance(delivery_status, dict):
+            result["delivery_status"] = delivery_status
+        action_metadata = receipt.get("action_metadata")
+        if isinstance(action_metadata, dict):
+            result["action_metadata"] = action_metadata
         return result
 
     """╔══════════════════════════════════════════════

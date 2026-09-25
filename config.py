@@ -6,9 +6,9 @@ from typing import Any, ClassVar, Dict, Optional
 
 from maibot_sdk import Field, PluginConfigBase
 
-SUPPORTED_CONFIG_VERSION = "1.1.0"
+SUPPORTED_CONFIG_VERSION = "1.2.0"
 # 供插件作者方便追踪插件版本
-PLUGIN_VERSION = "0.1.17"
+PLUGIN_VERSION = "0.1.18"
 
 DEFAULT_WS_PORT = 18763
 DEFAULT_MAX_RETRIES = 3
@@ -123,6 +123,21 @@ class IMessagePluginOptions(PluginConfigBase):
         return self.enabled
 
 
+class PhotonProjectConfig(PluginConfigBase):
+    """额外 Photon 项目及其可选的 iMessage 号码映射。"""
+
+    project_id: str = Field(default="", description="Photon 项目 ID。")
+    project_secret: str = Field(
+        default="",
+        description="Photon 项目密钥。",
+        json_schema_extra={"input_type": "password"},
+    )
+    lines: list[str] = Field(
+        default_factory=list,
+        description="此项目下的 iMessage 号码；用于项目未随会话元数据传回时辅助选路。",
+    )
+
+
 class PhotonServerConfig(PluginConfigBase):
     """Photon Spectrum 云端连接配置。"""
 
@@ -172,6 +187,63 @@ class PhotonServerConfig(PluginConfigBase):
             "placeholder": "PROJECT_SECRET",
         },
     )
+    line_phones: list[str] = Field(
+        default_factory=list,
+        description="当前 Photon 项目下的 iMessage 号码。多个号码会按会话所属线路选路。",
+        json_schema_extra={
+            "label": "iMessage 号码",
+            "hint": "多号码时填写项目分配的全部号码，使用国际格式，例如 +15551234567。",
+            "order": 2,
+        },
+    )
+    additional_projects: list[PhotonProjectConfig] = Field(
+        default_factory=list,
+        description="可选的其他 Photon 项目；每个项目可绑定多个 iMessage 号码。",
+        json_schema_extra={
+            "label": "其他 Photon 项目",
+            "hint": "用于连接多个 Photon Project。保留项目 ID 与密钥为空的条目会导致启动失败。",
+            "order": 3,
+        },
+    )
+
+    def configured_projects(self) -> list[dict[str, Any]]:
+        """Return validated credentials for all non-empty Photon projects."""
+
+        entries: list[dict[str, Any]] = []
+        primary_id = self.project_id.strip()
+        primary_secret = self.project_secret.strip()
+        if primary_id or primary_secret:
+            if not primary_id or not primary_secret:
+                raise ValueError("主 Photon 项目必须同时填写 project_id 和 project_secret")
+            entries.append(
+                {
+                    "project_id": primary_id,
+                    "project_secret": primary_secret,
+                    "lines": [value.strip() for value in self.line_phones if value.strip()],
+                }
+            )
+
+        for index, project in enumerate(self.additional_projects, start=1):
+            project_id = project.project_id.strip()
+            project_secret = project.project_secret.strip()
+            if not project_id and not project_secret:
+                continue
+            if not project_id or not project_secret:
+                raise ValueError(f"第 {index} 个额外 Photon 项目必须填写 ID 和密钥")
+            entries.append(
+                {
+                    "project_id": project_id,
+                    "project_secret": project_secret,
+                    "lines": [value.strip() for value in project.lines if value.strip()],
+                }
+            )
+
+        project_ids = [entry["project_id"] for entry in entries]
+        if not entries:
+            raise ValueError("至少配置一个 Photon 项目")
+        if len(project_ids) != len(set(project_ids)):
+            raise ValueError("Photon 项目 ID 不得重复")
+        return entries
 
 
 class SidecarBridgeConfig(PluginConfigBase):
