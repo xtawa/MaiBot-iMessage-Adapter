@@ -455,7 +455,7 @@ def to_mai_message_dict(data: dict[str, Any]) -> dict[str, Any]:
 
     raw_message: list[dict[str, Any]] = []
 
-    # 1. Reply 引用回复：兼容 MaiBot ReplyComponent (target_message_id + target_message_content + target_user_id)
+    # ReplyComponent reads its sender metadata from the nested data payload.
     reply_to = data.get("reply_to")
     if not isinstance(reply_to, dict) and isinstance(event, dict):
         ev_meta = event.get("metadata")
@@ -486,18 +486,27 @@ def to_mai_message_dict(data: dict[str, Any]) -> dict[str, Any]:
             ).strip()
             reply_sender = reply_to.get("sender") if isinstance(reply_to.get("sender"), dict) else {}
             reply_sender_id = str(
-                reply_to.get("target_user_id")
+                reply_to.get("target_message_sender_id")
+                or reply_to.get("target_user_id")
                 or reply_to.get("sender_id")
                 or reply_to.get("user_id")
                 or reply_sender.get("address")
                 or ""
             ).strip()
             reply_sender_name = str(
-                reply_to.get("target_user_nickname")
+                reply_to.get("target_message_sender_nickname")
+                or reply_to.get("target_user_nickname")
                 or reply_to.get("sender_name")
                 or reply_to.get("nickname")
                 or reply_sender.get("name")
                 or reply_sender_id
+                or ""
+            ).strip()
+            reply_sender_cardname = str(
+                reply_to.get("target_message_sender_cardname")
+                or reply_to.get("target_user_cardname")
+                or reply_to.get("sender_cardname")
+                or reply_sender.get("cardname")
                 or ""
             ).strip()
             reply_seg_data: dict[str, Any] = {
@@ -510,16 +519,16 @@ def to_mai_message_dict(data: dict[str, Any]) -> dict[str, Any]:
                 reply_seg_data["content"] = quoted_text
                 reply_seg_data["text"] = quoted_text
             if reply_sender_id:
-                reply_seg_data["target_user_id"] = reply_sender_id
+                reply_seg_data["target_message_sender_id"] = reply_sender_id
             if reply_sender_name:
-                reply_seg_data["target_user_nickname"] = reply_sender_name
+                reply_seg_data["target_message_sender_nickname"] = reply_sender_name
+            if reply_sender_cardname:
+                reply_seg_data["target_message_sender_cardname"] = reply_sender_cardname
             raw_message.append(
                 {
                     "type": "reply",
                     "target_message_id": target_id,
                     "target_message_content": quoted_text,
-                    "target_user_id": reply_sender_id,
-                    "target_user_nickname": reply_sender_name,
                     "data": reply_seg_data,
                 }
             )
@@ -566,16 +575,8 @@ def to_mai_message_dict(data: dict[str, Any]) -> dict[str, Any]:
                 )
             raw_message.append(image_segment)
         elif att_type == "voice":
-            # Issue 1: 顶层必须携带 binary_data_base64 供 MaiBot PluginMessageUtils._build_binary_component 读取
+            # MaiBot reads data as VoiceComponent.content and binary_data_base64 as its bytes.
             duration = attachment.get("duration")
-            voice_data: dict[str, Any] = {
-                "binary_data_base64": data_base64,
-                "base64": data_base64,
-                "data_base64": data_base64,
-                "mime_type": mime_type,
-                "name": file_name,
-                "duration": duration,
-            }
             voice_segment: dict[str, Any] = {
                 "type": "voice",
                 "binary_data_base64": data_base64,
@@ -583,11 +584,11 @@ def to_mai_message_dict(data: dict[str, Any]) -> dict[str, Any]:
                 "mime_type": mime_type,
                 "name": file_name,
                 "duration": duration,
-                "data": voice_data,
+                "data": "",
             }
             raw_message.append(voice_segment)
         else:
-            # Issue 2: FileComponent.from_payload 读取 base64，同时保留顶层 binary_data_base64 与 base64
+            # MaiBot has no video segment branch; video uses FileComponent with a video MIME type.
             file_payload = dict(attachment)
             file_payload["base64"] = data_base64
             file_payload["binary_data_base64"] = data_base64
@@ -596,7 +597,7 @@ def to_mai_message_dict(data: dict[str, Any]) -> dict[str, Any]:
             file_payload["name"] = file_name
             raw_message.append(
                 {
-                    "type": "video" if att_type == "video" else "file",
+                    "type": "file",
                     "name": file_name,
                     "mime_type": mime_type,
                     "base64": data_base64,

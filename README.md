@@ -25,6 +25,7 @@ git clone https://github.com/xtawa/MaiBot-iMessage-Adapter.git
 
 | 依赖 | 最低版本 | 用途 |
 |------|----------|------|
+| maibot-plugin-sdk (PyPI) | 2.3.0–2.8.2 | 插件组件注册；CI 对此范围内已发布的每个版本运行 Python 与 MaiBot Host 组件回环测试 |
 | nodeenv (PyPI) | ≥ 1.10.0 | 系统无 Node.js 时自动安装到插件目录下 |
 | Node.js | 20.18.1+ 或 ≥ 22 | 侧车运行时。插件会校验系统 Node.js 版本；版本不满足当前锁定依赖要求时，会自动通过 nodeenv 安装隔离的 LTS 到插件目录下的 `.nodeenv/` |
 | Photon 账号 | — | iMessage 云端服务，在 [app.photon.codes](https://app.photon.codes) 注册 |
@@ -111,7 +112,7 @@ Photon免费的计划不支持电子邮件地址的iMessage !
 | `imessage_chat_and_group` | 管理 iMessage 群聊或会话（修改群名、拉人/踢人、展示带心跳与回复结束自动停止的输入中气泡、穿透勿扰模式强制提醒） |
 | `imessage_location_and_check` | 发送 Apple Maps 定位卡片（降级模式）、主动刷新并查询 Find My 实时位置、或检测号码是否支持 iMessage 蓝泡泡 |
 
-> **多会话并发防串台保护**：当存在多个并发活跃 iMessage 会话且调用 `@Tool` 未指定 `chat_id` 时，适配器会拒绝猜测全局最近会话并提示显式传入 `chat_id`（单活跃会话时可自动关联）。
+> **多会话 Tool 路由**：当前 MaiBot Host 向插件 Tool 注入的是 Host 会话哈希。适配器会依据入站消息的用户或群组、线路号码和项目标识建立哈希到 iMessage `chat_id` 的映射；多个会话并行时可自动选中调用方会话。映射缺失时会拒绝执行并提示显式传入 `chat_id`，避免猜测目标。
 
 ### 内联动作标签（Inline Action Tags）
 
@@ -129,12 +130,12 @@ Photon免费的计划不支持电子邮件地址的iMessage !
 
 | 类别 | 数量 / 范围 | 适配说明 |
 |------|-------------|----------|
-| **原生结构化动作 (`NATIVE_STRUCTURED_ACTIONS`)** | **29 项** | `send`、`open_dm`、`send_reply`、`send_reaction`、`remove_reaction`、`edit_message`、`unsend_message`、`send_effect`、`send_audio_message`、`send_sticker`、`place_sticker`、`send_live_photo`、`send_link_card`、`send_music_card`、`send_transfer_card`、`update_transfer_card`、`share_my_contact`、`send_contact_card`、`find_my_location`、`create_poll`、`vote_poll`、`add_poll_option`、`set_typing`、`mark_read`、`notify_silenced`、`set_chat_background`、`remove_chat_background`、`manage_group`、`check_imessage_availability`、`enroll_shared_user` |
+| **原生结构化动作 (`NATIVE_STRUCTURED_ACTIONS`)** | **29 项** | `send`、`open_dm`、`send_reply`、`send_reaction`、`remove_reaction`、`edit_message`、`unsend_message`、`send_effect`、`send_audio_message`、`place_sticker`、`send_live_photo`、`send_link_card`、`send_music_card`、`send_transfer_card`、`update_transfer_card`、`share_my_contact`、`send_vcard`、`find_my_location`、`create_poll`、`vote_poll`、`unvote_poll`、`add_poll_option`、`set_typing`、`mark_read`、`notify_silenced`、`set_chat_background`、`manage_group`、`check_imessage_availability`、`enroll_shared_user` |
 | **降级结构化动作 (`FALLBACK_STRUCTURED_ACTIONS`)** | **2 项** (`fallback_mode: true`) | `send_location`（通过 `https://maps.apple.com/` 富链接卡片 + Google Maps 静态预览图发送，非 CLLocation 原生数据包）、`send_handwriting`（服务端渲染手写笔迹 PNG 图片附件发送，回执中显式标记 `fallback_mode: true, native: false`） |
 | **仅支持入站解析的能力** | Digital Touch / 第三方扩展气泡 | 入站消息自动调用 `photon.messages.getEmbeddedMedia` 提取 Apple 手写与 Digital Touch 内嵌媒体，并解析 Apple Cash、Find My、网易云音乐、QQ 音乐、B 站、小红书等 15+ 种扩展气泡；**出站不支持 `send_digital_touch`**（调用时会显式报错拒绝） |
-| **MaiBot 标准消息段对齐** | `voice` / `file` / `reply` / `additional_config` | `voice` 段顶层提供 `binary_data_base64`（兼容 `PluginMessageUtils._build_binary_component`）；`file`/`video` 段在 `data` 内外均提供 `base64`（兼容 `FileComponent.from_payload`）；`reply` 段完整提供 `target_message_content`、`target_message_id`、`target_user_id`、`target_user_nickname`；原生事件无损保存在 `message_info.additional_config["imessage_event"]`，不向 `raw_message` 注入非标准段类型 |
+| **MaiBot 标准消息段对齐** | `voice` / `file` / `reply` / `additional_config` | `voice.data` 为字符串，二进制放在顶层 `binary_data_base64`；视频作为 `type="file"` 且 `mime_type="video/..."` 传入 `FileComponent`；`reply.data` 提供 `target_message_id`、`target_message_content`、`target_message_sender_*`；原生事件保存在 `message_info.additional_config["imessage_event"]` |
 | **底层 gRPC 5 路实时事件流订阅** | `messages` / `chats` / `polls` / `groups` / `locations` | 侧车同时订阅 `AdvancedIMessage` 的 `messages`、`chats`、`polls`、`groups` 与 `locations.watch()` 实时流，完整捕获入站撤回（含缓存原文回溯）、消息编辑（含修改前后对比）、已读回执、贴纸放置、聊天背景变更、投票选项追加、群变更及 Find My 位置更新 (`location.updated`) |
-| **Typing 生命周期与投递核验** | 心跳保活 + 结束即停 + 12s 核验 | 收到消息后开启带 4s 心跳保活的 Typing Indicator，在 `send_to_imessage` 完成或报错时立即发送 `set_typing(false)` 关闭；出站 12 秒后自动核验底层投递状态；大附件下载内置 4 次指数退避重试 |
+| **Typing 与投递核验** | 4s 心跳 + 约 20s 上限 + 12s 核验 | 收到消息后开启 Typing Indicator，侧车每 4 秒保活，最长约 20 秒；`send_to_imessage` 完成或报错时发送 `set_typing(false)`。若思考超过上限或没有出站消息，状态会提前或依超时结束。出站 12 秒后核验投递状态；大附件下载内置 4 次指数退避重试 |
 
 ## 故障排查
 

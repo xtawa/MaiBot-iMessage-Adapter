@@ -23,7 +23,7 @@ jobs:
       - name: Install MaiBot Plugin SDK & Python dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "maibot-plugin-sdk>=2.1.0" "websockets>=12.0,<17.0" "nodeenv>=1.8.0"
+          python -m pip install "maibot-plugin-sdk>=2.3.0,<=2.8.2" "websockets>=12.0,<17.0" "nodeenv>=1.8.0"
 
       - name: Check Python syntax
         run: python -m compileall -q plugin.py config.py debug.py protocol.py tests
@@ -53,3 +53,34 @@ jobs:
       - name: Typecheck with Spectrum-supported TypeScript 6
         working-directory: sidecar
         run: npx --yes -p typescript@6.0.3 tsc -p tsconfig.json --noEmit
+
+  sdk-host-compatibility:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sdk-version: ["2.3.0", "2.4.0", "2.5.0", "2.5.1", "2.5.2", "2.5.3", "2.5.4", "2.6.0", "2.7.0", "2.7.1", "2.8.0", "2.8.1", "2.8.2"]
+    steps:
+      - name: Checkout adapter
+        uses: actions/checkout@v4
+      - name: Checkout pinned MaiBot Host parser
+        uses: actions/checkout@v4
+        with:
+          repository: Mai-with-u/MaiBot
+          ref: da2f632c066b20d5e7c2ddbfe97c51dcabe2ebf9
+          path: .maibot-host
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            src/common/data_models/message_component_data_model.py
+            src/common/utils/utils_session.py
+            src/plugin_runtime/host/message_utils.py
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install exact SDK release
+        run: python -m pip install "maibot-plugin-sdk==${{ matrix.sdk-version }}" "websockets>=12.0,<17.0" "nodeenv>=1.8.0"
+      - name: Test SDK and actual MaiBot Host component round-trip
+        env:
+          MAIBOT_HOST_SOURCE: .maibot-host
+        run: python -m unittest discover -s tests -v

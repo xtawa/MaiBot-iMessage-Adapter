@@ -1,4 +1,6 @@
 import asyncio
+from pathlib import Path
+import re
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
@@ -16,6 +18,13 @@ from protocol import (
 
 
 class AdapterProtocolTests(unittest.TestCase):
+    def test_documented_native_actions_match_protocol(self):
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+        row = next(line for line in readme.splitlines() if line.startswith("| **原生结构化动作"))
+        documented = re.findall(r"`([^`]+)`", row)[1:]
+        self.assertEqual(len(documented), len(NATIVE_STRUCTURED_ACTIONS))
+        self.assertEqual(set(documented), NATIVE_STRUCTURED_ACTIONS)
+
     def test_ordered_text_and_multiple_media_parts_are_preserved(self):
         event = {
             "schema_version": 1,
@@ -77,7 +86,7 @@ class AdapterProtocolTests(unittest.TestCase):
         # raw_message only contains standard MaiBot segment types; native_event is in additional_config
         self.assertEqual(
             [segment["type"] for segment in segments],
-            ["text", "image", "voice", "text", "file", "video"],
+            ["text", "image", "voice", "text", "file", "file"],
         )
         self.assertEqual(segments[0]["data"], "before")
         self.assertEqual(segments[1]["mime_type"], "image/heic")
@@ -88,8 +97,7 @@ class AdapterProtocolTests(unittest.TestCase):
         voice_seg = segments[2]
         self.assertEqual(voice_seg["type"], "voice")
         self.assertEqual(voice_seg["binary_data_base64"], "YXVkaW8=")
-        self.assertEqual(voice_seg["data"]["binary_data_base64"], "YXVkaW8=")
-        self.assertEqual(voice_seg["data"]["base64"], "YXVkaW8=")
+        self.assertEqual(voice_seg["data"], "")
 
         self.assertEqual(segments[3]["data"], "after")
 
@@ -100,7 +108,8 @@ class AdapterProtocolTests(unittest.TestCase):
         self.assertEqual(file_seg["binary_data_base64"], "ZmlsZQ==")
 
         video_seg = segments[5]
-        self.assertEqual(video_seg["type"], "video")
+        self.assertEqual(video_seg["type"], "file")
+        self.assertEqual(video_seg["data"]["mime_type"], "video/mp4")
         self.assertEqual(video_seg["data"]["base64"], "dmlkZW8=")
         self.assertEqual(video_seg["binary_data_base64"], "dmlkZW8=")
 
@@ -209,6 +218,7 @@ class AdapterProtocolTests(unittest.TestCase):
                     "text": "今晚去吃火锅吗？",
                     "target_user_id": "+15550000002",
                     "target_user_nickname": "Alice",
+                    "target_user_cardname": "Alice C",
                 },
             }
         )
@@ -217,8 +227,9 @@ class AdapterProtocolTests(unittest.TestCase):
         # Issue 10: Both top-level and data include target_message_content for MaiBot ReplyComponent
         self.assertEqual(segments[0]["target_message_id"], "msg-100")
         self.assertEqual(segments[0]["target_message_content"], "今晚去吃火锅吗？")
-        self.assertEqual(segments[0]["target_user_id"], "+15550000002")
-        self.assertEqual(segments[0]["target_user_nickname"], "Alice")
+        self.assertEqual(segments[0]["data"]["target_message_sender_id"], "+15550000002")
+        self.assertEqual(segments[0]["data"]["target_message_sender_nickname"], "Alice")
+        self.assertEqual(segments[0]["data"]["target_message_sender_cardname"], "Alice C")
         self.assertEqual(segments[0]["data"]["target_message_id"], "msg-100")
         self.assertEqual(segments[0]["data"]["target_message_content"], "今晚去吃火锅吗？")
         self.assertEqual(segments[0]["data"]["text"], "今晚去吃火锅吗？")

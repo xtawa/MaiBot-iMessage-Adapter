@@ -85,6 +85,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
     _shutting_down: bool = False
     _pending_sends: dict[str, asyncio.Future] = {}
     _chat_states: dict[str, dict[str, Any]] = {}
+    _host_session_chat_ids: dict[str, str] = {}
     _active_typing_chats: set[str] = set()
 
     """═══════════════════════════════════════════════
@@ -94,6 +95,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
     async def on_load(self) -> None:
         self._pending_sends = {}
         self._chat_states = {}
+        self._host_session_chat_ids = {}
         self._active_typing_chats = set()
         await self._restart_connection_if_needed()
 
@@ -398,7 +400,11 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                         )
                         if not accepted:
                             self.ctx.logger.debug("Host 未接收入站消息: %s", external_id)
-                        elif (
+                        elif chat_id:
+                            self._host_session_chat_ids[
+                                self._host_session_id_for_inbound(mai_msg, line_phone, project_id)
+                            ] = chat_id
+                        if accepted and (
                             tp == "message"
                             and chat_id
                             and getattr(self.config.plugin, "auto_typing_indicator", True)
@@ -1023,6 +1029,8 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                         else "application/octet-stream"
                     )
                 )
+                if comp_type == "file" and mime_type.lower().startswith("video/"):
+                    is_video = True
                 is_live_photo = bool(companion_b64) and is_image
                 attachment_index = len(attachments)
                 attachment = {
@@ -1306,7 +1314,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         line_phone: str = "",
         project_id: str = "",
     ) -> None:
-        """在 MaiBot 完成回复或发送结束时立即关闭正在输入状态。"""
+        """在发送完成或报错后关闭正在输入状态。"""
         if not chat_id:
             return
         was_typing = chat_id in self._active_typing_chats
@@ -1333,6 +1341,21 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         except Exception as exc:
             self.ctx.logger.debug("停止 typing indicator 失败: %s", exc)
 
+    @staticmethod
+    def _host_session_id_for_inbound(message: dict[str, Any], line_phone: str, project_id: str) -> str:
+        """Match MaiBot SessionUtils.calculate_session_id for this gateway's route metadata."""
+        info = message["message_info"]
+        group = info.get("group_info")
+        user_id = str(info["user_info"]["user_id"])
+        group_id = str(group.get("group_id") or "") if isinstance(group, dict) else ""
+        parts = ["imessage"]
+        if line_phone and line_phone != "shared":
+            parts.append(f"account:{line_phone}")
+        if project_id:
+            parts.append(f"scope:{project_id}")
+        parts.extend([group_id] if group_id else [user_id, "private"])
+        return hashlib.md5("_".join(parts).encode()).hexdigest()
+
     def _resolve_active_chat_context(self, chat_id: str = "", **kwargs: Any) -> dict[str, str]:
         """解析目标会话的 chat_id、line_phone 与 project_id。
 
@@ -1352,7 +1375,11 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
         resolved_chat = ""
         if candidate:
-            if candidate in self._chat_states:
+            if candidate in self._host_session_chat_ids:
+                resolved_chat = self._host_session_chat_ids[candidate]
+            elif len(candidate) == 32 and all(char in "0123456789abcdef" for char in candidate.lower()):
+                raise ValueError("未找到 MaiBot 会话对应的 iMessage chat_id，请显式指定目标 chat_id")
+            elif candidate in self._chat_states:
                 resolved_chat = candidate
             else:
                 suffix_matches = [
@@ -1410,12 +1437,12 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                 ctx_info = self._resolve_active_chat_context(explicit_chat, **kwargs)
             except ValueError as exc:
                 return {"success": False, "error": str(exc)}
-        resolved_chat = explicit_chat or ctx_info["chat_id"]
+        resolved_chat = ctx_info["chat_id"]
         data = {
-            "chat_id": resolved_chat,
             "line_phone": str(action_payload.get("line_phone", "") or ctx_info["line_phone"]),
             "project_id": str(action_payload.get("project_id", "") or ctx_info["project_id"]),
             **action_payload,
+            "chat_id": resolved_chat,
         }
         request_id = secrets.token_hex(16)
         loop = asyncio.get_running_loop()
@@ -1476,7 +1503,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="chat_id",
                 param_type=ToolParamType.STRING,
-                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；当存在多个并发会话时必须显式提供，单会话时可留空）",
+                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；可留空，MaiBot Host 会话可自动映射；映射缺失时需显式提供）",
                 required=False,
             ),
         ],
@@ -1533,7 +1560,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="chat_id",
                 param_type=ToolParamType.STRING,
-                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；当存在多个并发会话时必须显式提供，单会话时可留空）",
+                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；可留空，MaiBot Host 会话可自动映射；映射缺失时需显式提供）",
                 required=False,
             ),
         ],
@@ -1603,7 +1630,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="chat_id",
                 param_type=ToolParamType.STRING,
-                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；当存在多个并发会话时必须显式提供，单会话时可留空）",
+                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；可留空，MaiBot Host 会话可自动映射；映射缺失时需显式提供）",
                 required=False,
             ),
         ],
@@ -1658,7 +1685,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="chat_id",
                 param_type=ToolParamType.STRING,
-                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；当存在多个并发会话时必须显式提供，单会话时可留空）",
+                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；可留空，MaiBot Host 会话可自动映射；映射缺失时需显式提供）",
                 required=False,
             ),
         ],
@@ -1739,7 +1766,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="chat_id",
                 param_type=ToolParamType.STRING,
-                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；当存在多个并发会话时必须显式提供，单会话时可留空）",
+                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；可留空，MaiBot Host 会话可自动映射；映射缺失时需显式提供）",
                 required=False,
             ),
         ],
@@ -1812,7 +1839,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="chat_id",
                 param_type=ToolParamType.STRING,
-                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；当存在多个并发会话时必须显式提供，单会话时可留空）",
+                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；可留空，MaiBot Host 会话可自动映射；映射缺失时需显式提供）",
                 required=False,
             ),
         ],
@@ -1884,7 +1911,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="chat_id",
                 param_type=ToolParamType.STRING,
-                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；当存在多个并发会话时必须显式提供，单会话时可留空）",
+                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；可留空，MaiBot Host 会话可自动映射；映射缺失时需显式提供）",
                 required=False,
             ),
         ],
