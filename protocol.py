@@ -6,40 +6,48 @@ import re
 from typing import Any
 
 
-_STRUCTURED_ACTIONS = {
-    "send",
-    "send_reply",
-    "edit_message",
-    "unsend_message",
-    "send_reaction",
-    "remove_reaction",
-    "send_audio_message",
-    "send_live_photo",
-    "send_effect",
-    "create_poll",
-    "vote_poll",
-    "unvote_poll",
-    "add_poll_option",
-    "send_location",
-    "send_link_card",
-    "send_music_card",
-    "send_transfer_card",
-    "update_transfer_card",
-    "send_vcard",
-    "share_my_contact",
-    "set_chat_background",
-    "send_handwriting",
-    "send_digital_touch",
-    "place_sticker",
-    "set_typing",
-    "mark_read",
-    "notify_silenced",
-    "manage_group",
-    "find_my_location",
-    "check_imessage_availability",
-    "enroll_shared_user",
-    "open_dm",
-}
+NATIVE_STRUCTURED_ACTIONS = frozenset(
+    {
+        "send",
+        "send_reply",
+        "edit_message",
+        "unsend_message",
+        "send_reaction",
+        "remove_reaction",
+        "send_audio_message",
+        "send_live_photo",
+        "send_effect",
+        "create_poll",
+        "vote_poll",
+        "unvote_poll",
+        "add_poll_option",
+        "send_link_card",
+        "send_music_card",
+        "send_transfer_card",
+        "update_transfer_card",
+        "send_vcard",
+        "share_my_contact",
+        "set_chat_background",
+        "place_sticker",
+        "set_typing",
+        "mark_read",
+        "notify_silenced",
+        "manage_group",
+        "find_my_location",
+        "check_imessage_availability",
+        "enroll_shared_user",
+        "open_dm",
+    }
+)
+
+FALLBACK_STRUCTURED_ACTIONS = frozenset(
+    {
+        "send_location",
+        "send_handwriting",
+    }
+)
+
+_STRUCTURED_ACTIONS = NATIVE_STRUCTURED_ACTIONS | FALLBACK_STRUCTURED_ACTIONS
 
 _XML_BLOCK_RE = re.compile(
     r"<(thinking|thought|analysis|scratchpad)\b[^>]*>.*?</\1>",
@@ -72,6 +80,12 @@ def extract_structured_action(message: dict[str, Any]) -> dict[str, Any] | None:
 
     candidate = message.get("imessage_action")
     if candidate is None:
+        message_info = message.get("message_info")
+        if isinstance(message_info, dict):
+            add_cfg = message_info.get("additional_config")
+            if isinstance(add_cfg, dict):
+                candidate = add_cfg.get("imessage_action")
+    if candidate is None:
         raw_message = message.get("raw_message")
         if isinstance(raw_message, list):
             for segment in raw_message:
@@ -90,10 +104,16 @@ def extract_structured_action(message: dict[str, Any]) -> dict[str, Any] | None:
         raise ValueError("imessage_action 必须是对象")
 
     action = str(candidate.get("action", "")).strip().lower()
+    if action == "send_digital_touch":
+        raise ValueError(
+            "Digital Touch 出站发送未获 Photon/Spectrum SDK 公共接口支持（仅支持入站识别与内嵌图像提取）"
+        )
     if action not in _STRUCTURED_ACTIONS:
         raise ValueError(f"不支持的 iMessage Action: {action or '<empty>'}")
     result = dict(candidate)
     result["action"] = action
+    if action in FALLBACK_STRUCTURED_ACTIONS:
+        result.setdefault("fallback_mode", True)
     return result
 
 
@@ -387,11 +407,38 @@ def native_event_summary(event: Any) -> str:
     if kind == "sticker.placed":
         return "[iMessage 系统事件] 对方在消息气泡上贴了一张贴纸"
 
+    if kind == "location.updated":
+        loc = metadata.get("location") if isinstance(metadata.get("location"), dict) else metadata
+        handle = str(loc.get("handle") or loc.get("address") or loc.get("sender") or "").strip()
+        lat = loc.get("latitude")
+        lng = loc.get("longitude")
+        coord_str = f" ({lat}, {lng})" if lat is not None and lng is not None else ""
+        return f"[iMessage Find My 位置更新] {handle or '联系人'}更新了实时位置{coord_str}"
+
     return f"[iMessage 系统事件] 收到原生内容：{kind}"
 
 
+def extract_native_event(message: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract the structured iMessage native event from additional_config (or legacy raw_message)."""
+    if not isinstance(message, dict):
+        return None
+    message_info = message.get("message_info")
+    if isinstance(message_info, dict):
+        additional_config = message_info.get("additional_config")
+        if isinstance(additional_config, dict):
+            ev = additional_config.get("imessage_event")
+            if isinstance(ev, dict):
+                return ev
+    raw_message = message.get("raw_message")
+    if isinstance(raw_message, list):
+        for seg in raw_message:
+            if isinstance(seg, dict) and seg.get("type") == "imessage_event" and isinstance(seg.get("data"), dict):
+                return seg["data"]
+    return None
+
+
 def to_mai_message_dict(data: dict[str, Any]) -> dict[str, Any]:
-    """Convert one sidecar envelope without discarding ordered parts or metadata."""
+    """Convert one sidecar envelope into a MaiBot-compatible message dictionary."""
 
     sender = data.get("sender")
     if not isinstance(sender, dict):
@@ -408,7 +455,7 @@ def to_mai_message_dict(data: dict[str, Any]) -> dict[str, Any]:
 
     raw_message: list[dict[str, Any]] = []
 
-    # 如果入站消息是引用回复 (reply_to)，先插入 MaiBot 标准 reply 消息段
+    # 1. Reply 引用回复：兼容 MaiBot ReplyComponent (target_message_id + target_message_content + target_user_id)
     reply_to = data.get("reply_to")
     if not isinstance(reply_to, dict) and isinstance(event, dict):
         ev_meta = event.get("metadata")
@@ -420,7 +467,10 @@ def to_mai_message_dict(data: dict[str, Any]) -> dict[str, Any]:
             target_obj = ev_meta["target"]
             target_id = str(target_obj.get("id", "") or "").strip()
             if target_id:
-                reply_to = {"target_message_id": target_id}
+                reply_to = {
+                    "target_message_id": target_id,
+                    "text": str(target_obj.get("text", "") or "").strip(),
+                }
     if isinstance(reply_to, dict):
         target_id = str(
             reply_to.get("target_message_id")
@@ -428,27 +478,83 @@ def to_mai_message_dict(data: dict[str, Any]) -> dict[str, Any]:
             or ""
         ).strip()
         if target_id:
+            quoted_text = str(
+                reply_to.get("target_message_content")
+                or reply_to.get("content")
+                or reply_to.get("text")
+                or ""
+            ).strip()
+            reply_sender = reply_to.get("sender") if isinstance(reply_to.get("sender"), dict) else {}
+            reply_sender_id = str(
+                reply_to.get("target_user_id")
+                or reply_to.get("sender_id")
+                or reply_to.get("user_id")
+                or reply_sender.get("address")
+                or ""
+            ).strip()
+            reply_sender_name = str(
+                reply_to.get("target_user_nickname")
+                or reply_to.get("sender_name")
+                or reply_to.get("nickname")
+                or reply_sender.get("name")
+                or reply_sender_id
+                or ""
+            ).strip()
             reply_seg_data: dict[str, Any] = {
                 "target_message_id": target_id,
                 "message_id": target_id,
+                "id": target_id,
+                "target_message_content": quoted_text,
             }
-            quoted_text = str(reply_to.get("text", "") or "").strip()
             if quoted_text:
+                reply_seg_data["content"] = quoted_text
                 reply_seg_data["text"] = quoted_text
-            raw_message.append({"type": "reply", "data": reply_seg_data})
+            if reply_sender_id:
+                reply_seg_data["target_user_id"] = reply_sender_id
+            if reply_sender_name:
+                reply_seg_data["target_user_nickname"] = reply_sender_name
+            raw_message.append(
+                {
+                    "type": "reply",
+                    "target_message_id": target_id,
+                    "target_message_content": quoted_text,
+                    "target_user_id": reply_sender_id,
+                    "target_user_nickname": reply_sender_name,
+                    "data": reply_seg_data,
+                }
+            )
 
     def append_attachment(attachment: Any) -> None:
         if not isinstance(attachment, dict):
             return
         att_type = str(attachment.get("type", "file")).strip().lower()
-        data_base64 = str(attachment.get("data_base64", "") or "")
+        data_base64 = str(
+            attachment.get("data_base64")
+            or attachment.get("base64")
+            or attachment.get("binary_data_base64")
+            or ""
+        )
+        mime_type = str(
+            attachment.get("mime_type")
+            or (
+                "image/png"
+                if att_type == "image"
+                else "audio/mp4"
+                if att_type == "voice"
+                else "video/mp4"
+                if att_type == "video"
+                else "application/octet-stream"
+            )
+        )
+        file_name = str(attachment.get("name", "") or "")
         if att_type == "image":
             image_segment = {
                 "type": "image",
                 "data": "",
                 "binary_data_base64": data_base64,
-                "mime_type": attachment.get("mime_type", "image/*"),
-                "name": attachment.get("name", ""),
+                "base64": data_base64,
+                "mime_type": mime_type,
+                "name": file_name,
                 "hash": "",
             }
             companion_base64 = attachment.get("companion_data_base64")
@@ -460,19 +566,44 @@ def to_mai_message_dict(data: dict[str, Any]) -> dict[str, Any]:
                 )
             raw_message.append(image_segment)
         elif att_type == "voice":
+            # Issue 1: 顶层必须携带 binary_data_base64 供 MaiBot PluginMessageUtils._build_binary_component 读取
+            duration = attachment.get("duration")
+            voice_data: dict[str, Any] = {
+                "binary_data_base64": data_base64,
+                "base64": data_base64,
+                "data_base64": data_base64,
+                "mime_type": mime_type,
+                "name": file_name,
+                "duration": duration,
+            }
+            voice_segment: dict[str, Any] = {
+                "type": "voice",
+                "binary_data_base64": data_base64,
+                "base64": data_base64,
+                "mime_type": mime_type,
+                "name": file_name,
+                "duration": duration,
+                "data": voice_data,
+            }
+            raw_message.append(voice_segment)
+        else:
+            # Issue 2: FileComponent.from_payload 读取 base64，同时保留顶层 binary_data_base64 与 base64
+            file_payload = dict(attachment)
+            file_payload["base64"] = data_base64
+            file_payload["binary_data_base64"] = data_base64
+            file_payload["data_base64"] = data_base64
+            file_payload["mime_type"] = mime_type
+            file_payload["name"] = file_name
             raw_message.append(
                 {
-                    "type": "voice",
-                    "data": {
-                        "binary_data_base64": data_base64,
-                        "mime_type": attachment.get("mime_type", "audio/mp4"),
-                        "name": attachment.get("name", ""),
-                        "duration": attachment.get("duration"),
-                    },
+                    "type": "video" if att_type == "video" else "file",
+                    "name": file_name,
+                    "mime_type": mime_type,
+                    "base64": data_base64,
+                    "binary_data_base64": data_base64,
+                    "data": file_payload,
                 }
             )
-        else:
-            raw_message.append({"type": "file", "data": dict(attachment)})
 
     parts = data.get("parts")
     used_parts = isinstance(parts, list) and bool(parts)
@@ -498,8 +629,6 @@ def to_mai_message_dict(data: dict[str, Any]) -> dict[str, Any]:
     if is_system_event and not text:
         summary = native_event_summary(event)
         raw_message.append({"type": "text", "data": summary})
-    if isinstance(event, dict):
-        raw_message.append({"type": "imessage_event", "data": event})
     if not raw_message:
         raw_message.append({"type": "text", "data": ""})
 
@@ -508,8 +637,18 @@ def to_mai_message_dict(data: dict[str, Any]) -> dict[str, Any]:
         additional_config["platform_io_account_id"] = line_phone
     if project_id:
         additional_config["platform_io_project_id"] = project_id
+    if chat_id:
+        additional_config["imessage_chat_id"] = chat_id
+    resolved_msg_id = str(data.get("message_id") or data.get("event_id", "") or "")
+    if resolved_msg_id:
+        additional_config["imessage_message_id"] = resolved_msg_id
     if is_system_event:
         additional_config["imessage_system_event"] = True
+    # Issue 9: 将原生事件稳定保存在 message_info.additional_config["imessage_event"] 中，
+    # 避免 MaiBot 将未知 raw_message type="imessage_event" 降级为 DictComponent 后丢失类型标识。
+    if isinstance(event, dict):
+        additional_config["imessage_event"] = event
+        additional_config["imessage_event_type"] = str(event.get("event_type", "") or "")
 
     group_info = None
     if str(data.get("space_type", "")).lower() == "group":
@@ -532,7 +671,7 @@ def to_mai_message_dict(data: dict[str, Any]) -> dict[str, Any]:
         message_info["group_info"] = group_info
 
     return {
-        "message_id": data.get("message_id") or data.get("event_id", ""),
+        "message_id": resolved_msg_id,
         "platform": "imessage",
         "session_id": chat_id,
         "message_info": message_info,

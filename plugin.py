@@ -21,35 +21,25 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from maibot_sdk import Command, MaiBotPlugin, MessageGateway
-try:
-    from maibot_sdk import Tool
-    from maibot_sdk.types import MessageGatewayRouteType, ToolParameterInfo, ToolParamType
-except ImportError:  # pragma: no cover - fallback for minimal SDK builds
-    from maibot_sdk.types import MessageGatewayRouteType
+from maibot_sdk import Command, MaiBotPlugin, MessageGateway, Tool
+from maibot_sdk.types import MessageGatewayRouteType, ToolParameterInfo, ToolParamType
 
-    def Tool(*args: Any, **kwargs: Any):  # type: ignore[misc]
-        def _decorator(func: Any) -> Any:
-            return func
-        return _decorator
-
-    class ToolParamType:  # type: ignore[no-redef]
-        STRING = "string"
-        INTEGER = "integer"
-        FLOAT = "float"
-        BOOLEAN = "boolean"
-
-    class ToolParameterInfo:  # type: ignore[no-redef]
-        def __init__(self, **kwargs: Any) -> None:
-            self.__dict__.update(kwargs)
-
-from .config import IMessageAdapterConfig, PLUGIN_VERSION
-from .protocol import (
-    extract_inline_imessage_action,
-    extract_reply_target,
-    extract_structured_action,
-    to_mai_message_dict,
-)
+if __package__:
+    from .config import IMessageAdapterConfig, PLUGIN_VERSION
+    from .protocol import (
+        extract_inline_imessage_action,
+        extract_reply_target,
+        extract_structured_action,
+        to_mai_message_dict,
+    )
+else:
+    from config import IMessageAdapterConfig, PLUGIN_VERSION
+    from protocol import (
+        extract_inline_imessage_action,
+        extract_reply_target,
+        extract_structured_action,
+        to_mai_message_dict,
+    )
 
 if TYPE_CHECKING:
     from maibot_sdk import PluginConfigBase
@@ -95,7 +85,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
     _shutting_down: bool = False
     _pending_sends: dict[str, asyncio.Future] = {}
     _chat_states: dict[str, dict[str, Any]] = {}
-    _most_recent_chat_id: str = ""
+    _active_typing_chats: set[str] = set()
 
     """═══════════════════════════════════════════════
     生命周期
@@ -104,7 +94,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
     async def on_load(self) -> None:
         self._pending_sends = {}
         self._chat_states = {}
-        self._most_recent_chat_id = ""
+        self._active_typing_chats = set()
         await self._restart_connection_if_needed()
 
     async def on_unload(self) -> None:
@@ -376,7 +366,6 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                             state["last_inbound_message_id"] = message_id
                         if isinstance(native_event, dict) and native_event.get("event_type") == "poll.created" and message_id:
                             state["latest_poll_message_id"] = message_id
-                        self._most_recent_chat_id = chat_id
 
                     if tp == "native_event" and not getattr(
                         self.config.plugin, "forward_native_events_to_maibot", True
@@ -413,28 +402,13 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                             tp == "message"
                             and chat_id
                             and getattr(self.config.plugin, "auto_typing_indicator", True)
-                            and self._bridge_ws is not None
                         ):
-                            try:
-                                await self._bridge_ws.send(
-                                    json.dumps(
-                                        {
-                                            "type": "action",
-                                            "request_id": secrets.token_hex(8),
-                                            "data": {
-                                                "action": "set_typing",
-                                                "chat_id": chat_id,
-                                                "line_phone": line_phone if line_phone != "shared" else "",
-                                                "project_id": project_id,
-                                                "typing": True,
-                                                "duration_ms": 8000,
-                                            },
-                                        },
-                                        ensure_ascii=False,
-                                    )
-                                )
-                            except Exception as typing_exc:
-                                self.ctx.logger.debug("发送输入中状态失败: %s", typing_exc)
+                            await self._start_typing_indicator(
+                                chat_id=chat_id,
+                                line_phone=line_phone if line_phone != "shared" else "",
+                                project_id=project_id,
+                                duration_ms=20000,
+                            )
                     except Exception as exc:
                         self.ctx.logger.error("注入 iMessage 入站事件失败: %s", exc)
 
@@ -999,7 +973,9 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                 nested_data = component_data if isinstance(component_data, dict) else {}
                 b64 = str(
                     component.get("binary_data_base64")
+                    or component.get("base64")
                     or nested_data.get("binary_data_base64")
+                    or nested_data.get("base64")
                     or nested_data.get("data_base64")
                     or ""
                 )
@@ -1260,6 +1236,12 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             return {"success": False, "error": str(exc) or "发送消息到侧车失败"}
         finally:
             self._pending_sends.pop(request_id, None)
+            if action_name != "set_typing":
+                await self._stop_typing_indicator(
+                    chat_id=chat_id,
+                    line_phone=line_phone,
+                    project_id=project_id,
+                )
 
         if not receipt.get("success", False):
             error = str(receipt.get("error", "") or "").strip() or "Photon 未提供发送失败原因"
@@ -1286,9 +1268,114 @@ class IMessageAdapterPlugin(MaiBotPlugin):
     内部动作调用辅助与 LLM Tool 组件（供 MaiBot 规划器主动调用）
     ╚══════════════════════════════════════════════"""
 
-    def _resolve_active_chat_context(self, chat_id: str = "") -> dict[str, str]:
-        """解析当前活跃会话的 chat_id、line_phone 与 project_id。"""
-        resolved_chat = str(chat_id or "").strip() or self._most_recent_chat_id
+    async def _start_typing_indicator(
+        self,
+        chat_id: str,
+        line_phone: str = "",
+        project_id: str = "",
+        duration_ms: int = 20000,
+    ) -> None:
+        """在收到入站消息、交给 MaiBot 思考时开启正在输入状态（侧车带心跳与超时兜底）。"""
+        if not chat_id or self._bridge_ws is None or not self._gateway_ready:
+            return
+        self._active_typing_chats.add(chat_id)
+        try:
+            await self._bridge_ws.send(
+                json.dumps(
+                    {
+                        "type": "action",
+                        "request_id": f"typing_start_{secrets.token_hex(8)}",
+                        "data": {
+                            "action": "set_typing",
+                            "chat_id": chat_id,
+                            "line_phone": line_phone,
+                            "project_id": project_id,
+                            "typing": True,
+                            "duration_ms": duration_ms,
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        except Exception as exc:
+            self.ctx.logger.debug("启动 typing indicator 失败: %s", exc)
+
+    async def _stop_typing_indicator(
+        self,
+        chat_id: str,
+        line_phone: str = "",
+        project_id: str = "",
+    ) -> None:
+        """在 MaiBot 完成回复或发送结束时立即关闭正在输入状态。"""
+        if not chat_id:
+            return
+        was_typing = chat_id in self._active_typing_chats
+        self._active_typing_chats.discard(chat_id)
+        if not was_typing or self._bridge_ws is None or not self._gateway_ready:
+            return
+        try:
+            await self._bridge_ws.send(
+                json.dumps(
+                    {
+                        "type": "action",
+                        "request_id": f"typing_stop_{secrets.token_hex(8)}",
+                        "data": {
+                            "action": "set_typing",
+                            "chat_id": chat_id,
+                            "line_phone": line_phone,
+                            "project_id": project_id,
+                            "typing": False,
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        except Exception as exc:
+            self.ctx.logger.debug("停止 typing indicator 失败: %s", exc)
+
+    def _resolve_active_chat_context(self, chat_id: str = "", **kwargs: Any) -> dict[str, str]:
+        """解析目标会话的 chat_id、line_phone 与 project_id。
+
+        多会话安全规则：
+        - 若显式提供了 chat_id（或 kwargs 中包含 session_id/stream_id/user_id/group_id），优先精确或后缀匹配对应会话；
+        - 若未提供 chat_id 且当前仅有 1 个活跃会话，则自动选中该唯一会话；
+        - 若未提供 chat_id 且存在多个并发活跃会话（len > 1），拒绝猜测全局最近会话并抛出 ValueError，防止多会话串台。
+        """
+        candidate = str(
+            chat_id
+            or kwargs.get("session_id")
+            or kwargs.get("stream_id")
+            or kwargs.get("group_id")
+            or kwargs.get("user_id")
+            or ""
+        ).strip()
+
+        resolved_chat = ""
+        if candidate:
+            if candidate in self._chat_states:
+                resolved_chat = candidate
+            else:
+                suffix_matches = [
+                    key
+                    for key in self._chat_states
+                    if key.endswith(f";{candidate}") or key == f"any;-;{candidate}"
+                ]
+                if len(suffix_matches) == 1:
+                    resolved_chat = suffix_matches[0]
+                else:
+                    resolved_chat = candidate
+        else:
+            active_keys = list(self._chat_states.keys())
+            if len(active_keys) == 1:
+                resolved_chat = active_keys[0]
+            elif len(active_keys) > 1:
+                raise ValueError(
+                    f"当前存在 {len(active_keys)} 个并发活跃 iMessage 会话（{', '.join(active_keys)}），"
+                    "为防止多会话串台，请显式指定目标 chat_id 参数"
+                )
+            else:
+                raise ValueError("当前没有活跃的 iMessage 会话，请显式指定目标 chat_id 参数")
+
         state = self._chat_states.get(resolved_chat, {})
         return {
             "chat_id": resolved_chat,
@@ -1303,12 +1390,27 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         self,
         action_payload: dict[str, Any],
         chat_id: str = "",
+        **kwargs: Any,
     ) -> dict[str, Any]:
         """直接向 Node.js 侧车发送结构化 iMessage 动作并等待执行回执。"""
         if self._bridge_ws is None or not self._gateway_ready:
             return {"success": False, "error": "iMessage 网关尚未就绪"}
-        ctx_info = self._resolve_active_chat_context(chat_id)
-        resolved_chat = str(action_payload.get("chat_id", "") or "").strip() or ctx_info["chat_id"]
+        explicit_chat = str(action_payload.get("chat_id", "") or chat_id or "").strip()
+        action_name = str(action_payload.get("action", "") or "").strip()
+        ctx_info: dict[str, str] = {
+            "chat_id": explicit_chat,
+            "line_phone": "",
+            "project_id": "",
+            "last_inbound_message_id": "",
+            "last_outbound_message_id": "",
+            "latest_poll_message_id": "",
+        }
+        if explicit_chat or action_name not in {"check_imessage_availability", "enroll_shared_user"}:
+            try:
+                ctx_info = self._resolve_active_chat_context(explicit_chat, **kwargs)
+            except ValueError as exc:
+                return {"success": False, "error": str(exc)}
+        resolved_chat = explicit_chat or ctx_info["chat_id"]
         data = {
             "chat_id": resolved_chat,
             "line_phone": str(action_payload.get("line_phone", "") or ctx_info["line_phone"]),
@@ -1374,7 +1476,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="chat_id",
                 param_type=ToolParamType.STRING,
-                description="目标会话 ID；留空则使用当前活跃 iMessage 会话",
+                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；当存在多个并发会话时必须显式提供，单会话时可留空）",
                 required=False,
             ),
         ],
@@ -1387,8 +1489,10 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         chat_id: str = "",
         **kwargs: Any,
     ) -> str:
-        del kwargs
-        ctx_info = self._resolve_active_chat_context(chat_id)
+        try:
+            ctx_info = self._resolve_active_chat_context(chat_id, **kwargs)
+        except ValueError as exc:
+            return f"iMessage 表情反应操作失败: {exc}"
         target_msg_id = str(message_id or "").strip() or ctx_info["last_inbound_message_id"]
         if not target_msg_id:
             return "未找到可点按表情的目标消息 ID"
@@ -1429,7 +1533,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="chat_id",
                 param_type=ToolParamType.STRING,
-                description="目标会话 ID；留空则使用当前活跃 iMessage 会话",
+                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；当存在多个并发会话时必须显式提供，单会话时可留空）",
                 required=False,
             ),
         ],
@@ -1442,9 +1546,11 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         chat_id: str = "",
         **kwargs: Any,
     ) -> str:
-        del kwargs
         op = str(operation or "reply").strip().lower()
-        ctx_info = self._resolve_active_chat_context(chat_id)
+        try:
+            ctx_info = self._resolve_active_chat_context(chat_id, **kwargs)
+        except ValueError as exc:
+            return f"iMessage 消息操作失败: {exc}"
         if op == "mark_read":
             res = await self._execute_sidecar_action(
                 {"action": "mark_read"},
@@ -1497,7 +1603,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="chat_id",
                 param_type=ToolParamType.STRING,
-                description="目标会话 ID；留空则使用当前活跃 iMessage 会话",
+                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；当存在多个并发会话时必须显式提供，单会话时可留空）",
                 required=False,
             ),
         ],
@@ -1509,8 +1615,10 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         chat_id: str = "",
         **kwargs: Any,
     ) -> str:
-        del kwargs
-        ctx_info = self._resolve_active_chat_context(chat_id)
+        try:
+            ctx_info = self._resolve_active_chat_context(chat_id, **kwargs)
+        except ValueError as exc:
+            return f"iMessage 特效消息发送失败: {exc}"
         res = await self._execute_sidecar_action(
             {"action": "send_effect", "text": text, "effect": effect},
             chat_id=ctx_info["chat_id"],
@@ -1550,7 +1658,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="chat_id",
                 param_type=ToolParamType.STRING,
-                description="目标会话 ID；留空则使用当前活跃 iMessage 会话",
+                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；当存在多个并发会话时必须显式提供，单会话时可留空）",
                 required=False,
             ),
         ],
@@ -1564,9 +1672,11 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         chat_id: str = "",
         **kwargs: Any,
     ) -> str:
-        del kwargs
         op = str(operation or "create").strip().lower()
-        ctx_info = self._resolve_active_chat_context(chat_id)
+        try:
+            ctx_info = self._resolve_active_chat_context(chat_id, **kwargs)
+        except ValueError as exc:
+            return f"iMessage 投票操作失败: {exc}"
         if op == "create":
             opts = [item.strip() for item in str(options_pipe_separated or "").split("|") if item.strip()]
             if len(opts) < 2:
@@ -1586,6 +1696,8 @@ class IMessageAdapterPlugin(MaiBotPlugin):
                 {
                     "action": "add_poll_option",
                     "poll_message_id": target_poll,
+                    "title": title_or_option,
+                    "option": title_or_option,
                     "option_text": title_or_option,
                 },
                 chat_id=ctx_info["chat_id"],
@@ -1595,6 +1707,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             {
                 "action": "vote_poll",
                 "poll_message_id": target_poll,
+                "option_id": title_or_option,
                 "option_identifier": title_or_option,
             },
             chat_id=ctx_info["chat_id"],
@@ -1626,7 +1739,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="chat_id",
                 param_type=ToolParamType.STRING,
-                description="目标会话 ID；留空则使用当前活跃 iMessage 会话",
+                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；当存在多个并发会话时必须显式提供，单会话时可留空）",
                 required=False,
             ),
         ],
@@ -1639,9 +1752,11 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         chat_id: str = "",
         **kwargs: Any,
     ) -> str:
-        del kwargs
         kind = str(card_type or "music").strip().lower()
-        ctx_info = self._resolve_active_chat_context(chat_id)
+        try:
+            ctx_info = self._resolve_active_chat_context(chat_id, **kwargs)
+        except ValueError as exc:
+            return f"iMessage 卡片发送失败: {exc}"
         if kind == "contact":
             res = await self._execute_sidecar_action(
                 {"action": "share_my_contact"},
@@ -1697,7 +1812,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="chat_id",
                 param_type=ToolParamType.STRING,
-                description="目标会话 ID；留空则使用当前活跃 iMessage 会话",
+                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；当存在多个并发会话时必须显式提供，单会话时可留空）",
                 required=False,
             ),
         ],
@@ -1709,9 +1824,11 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         chat_id: str = "",
         **kwargs: Any,
     ) -> str:
-        del kwargs
         op = str(operation or "rename").strip().lower()
-        ctx_info = self._resolve_active_chat_context(chat_id)
+        try:
+            ctx_info = self._resolve_active_chat_context(chat_id, **kwargs)
+        except ValueError as exc:
+            return f"iMessage 会话/群聊操作失败: {exc}"
         if op == "typing":
             res = await self._execute_sidecar_action(
                 {"action": "set_typing", "typing": True, "duration_ms": 8000},
@@ -1738,7 +1855,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
 
     @Tool(
         "imessage_location_and_check",
-        description="发送 Apple Maps 原生定位卡片（send_location）、读取/刷新 Find My 好友实时位置（find_my）或检测号码/邮箱是否开通 iMessage 蓝泡泡（check_availability）",
+        description="发送 Apple Maps 定位卡片（send_location，含 Google/Apple 地图预览降级）、读取/刷新 Find My 好友实时位置（find_my）或检测号码/邮箱是否开通 iMessage 蓝泡泡（check_availability）",
         parameters=[
             ToolParameterInfo(
                 name="operation",
@@ -1767,7 +1884,7 @@ class IMessageAdapterPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="chat_id",
                 param_type=ToolParamType.STRING,
-                description="目标会话 ID；留空则使用当前活跃 iMessage 会话",
+                description="目标会话 ID（如 iMessage;-;+8613800138000 或手机号/邮箱；当存在多个并发会话时必须显式提供，单会话时可留空）",
                 required=False,
             ),
         ],
@@ -1781,25 +1898,33 @@ class IMessageAdapterPlugin(MaiBotPlugin):
         chat_id: str = "",
         **kwargs: Any,
     ) -> str:
-        del kwargs
         op = str(operation or "send_location").strip().lower()
-        ctx_info = self._resolve_active_chat_context(chat_id)
+        if op == "check_availability":
+            res = await self._execute_sidecar_action(
+                {"action": "check_imessage_availability", "address": target_or_place},
+                chat_id=chat_id,
+                **kwargs,
+            )
+            if not res.get("success"):
+                return f"检测 iMessage 可用性失败: {res.get('error')}"
+            return f"iMessage 号码检测结果: {json.dumps(res.get('action_metadata') or {}, ensure_ascii=False)}"
+        try:
+            ctx_info = self._resolve_active_chat_context(chat_id, **kwargs)
+        except ValueError as exc:
+            return f"iMessage 定位操作失败: {exc}"
         if op == "find_my":
             res = await self._execute_sidecar_action(
-                {"action": "find_my_location", "refresh": True},
+                {
+                    "action": "find_my_location",
+                    "operation": "refresh",
+                    "refresh": True,
+                    "address": target_or_place,
+                },
                 chat_id=ctx_info["chat_id"],
             )
             if not res.get("success"):
                 return f"查询 Find My 位置失败: {res.get('error')}"
             return f"Find My 位置结果: {json.dumps(res.get('action_metadata') or {}, ensure_ascii=False)}"
-        if op == "check_availability":
-            res = await self._execute_sidecar_action(
-                {"action": "check_imessage_availability", "address": target_or_place},
-                chat_id=ctx_info["chat_id"],
-            )
-            if not res.get("success"):
-                return f"检测 iMessage 可用性失败: {res.get('error')}"
-            return f"iMessage 号码检测结果: {json.dumps(res.get('action_metadata') or {}, ensure_ascii=False)}"
         place_parts = [item.strip() for item in str(target_or_place or "").split("|") if item.strip()]
         name = place_parts[0] if place_parts else "位置分享"
         address = place_parts[1] if len(place_parts) > 1 else name

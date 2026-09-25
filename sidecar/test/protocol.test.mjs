@@ -3,6 +3,8 @@ import test from "node:test";
 
 import {
   BRIDGE_PROTOCOL_VERSION,
+  FALLBACK_STRUCTURED_ACTIONS,
+  NATIVE_STRUCTURED_ACTIONS,
   STRUCTURED_ACTIONS,
   buildAppleMapsUrl,
   decodeBase64Attachment,
@@ -22,11 +24,25 @@ import {
   toJsonSafeMetadata,
 } from "../dist/protocol.js";
 
-test("structured action protocol is versioned and supports extended iMessage actions", () => {
+test("structured action protocol is versioned and separates native vs fallback actions", () => {
   assert.equal(BRIDGE_PROTOCOL_VERSION, 3);
+  assert.equal(NATIVE_STRUCTURED_ACTIONS.size, 29);
+  assert.equal(FALLBACK_STRUCTURED_ACTIONS.size, 2);
+  assert.equal(STRUCTURED_ACTIONS.size, 31);
+  assert.ok(!STRUCTURED_ACTIONS.has("send_digital_touch"));
   assert.deepEqual(normalizeStructuredAction({ action: "send_reply", target_message_id: "m1" }), {
     action: "send_reply",
     target_message_id: "m1",
+  });
+  assert.deepEqual(normalizeStructuredAction({ action: "send_handwriting", image_base64: "aGVsbG8=" }), {
+    action: "send_handwriting",
+    image_base64: "aGVsbG8=",
+    fallback_mode: true,
+  });
+  assert.deepEqual(normalizeStructuredAction({ action: "send_location", label: "Apple Park" }), {
+    action: "send_location",
+    label: "Apple Park",
+    fallback_mode: true,
   });
   for (const act of [
     "vote_poll",
@@ -44,8 +60,9 @@ test("structured action protocol is versioned and supports extended iMessage act
     "check_imessage_availability",
     "enroll_shared_user",
   ]) {
-    assert.ok(STRUCTURED_ACTIONS.has(act), `expected ${act} in STRUCTURED_ACTIONS`);
+    assert.ok(NATIVE_STRUCTURED_ACTIONS.has(act), `expected ${act} in NATIVE_STRUCTURED_ACTIONS`);
   }
+  assert.throws(() => normalizeStructuredAction({ action: "send_digital_touch" }), /Digital Touch/);
   assert.throws(() => normalizeStructuredAction({ action: "delete_everything" }), /不支持/);
 });
 

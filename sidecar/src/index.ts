@@ -1310,21 +1310,38 @@ async function handleInboundMessage(
     runtime.lastInboundMessageByChat.set(chatId, msgId);
   }
 
-  // 若是对方给转账卡片贴了 Tapback/Emoji，自动将转账标记为「已收款」并改写气泡
+  // 若是对方给转账卡片贴了 Tapback/Emoji，自动将转账标记为「已收款」并更新原气泡为已收款置灰状态
   if (message.content?.type === "reaction") {
     const targetId = String(message.content?.target?.id ?? "").trim();
     const transfer = targetId ? runtime.transfersByMessageId.get(targetId) : undefined;
     if (transfer && transfer.state === "pending") {
-      transfer.state = "received";
-      extraMetadata.transfer_claimed = {
-        message_id: targetId,
-        amount: transfer.formattedAmount,
-        note: transfer.note,
-      };
+      try {
+        const updatedTransfer = await claimOrUpdateTransferBubble(runtime, space, targetId, {
+          amount: transfer.amount,
+          currency: transfer.currency,
+          note: transfer.note,
+          appName: transfer.appName,
+        });
+        extraMetadata.transfer_claimed = {
+          message_id: targetId,
+          updated_message_id: updatedTransfer.messageId,
+          amount: transfer.formattedAmount,
+          note: transfer.note,
+          original_retracted: updatedTransfer.originalRetracted,
+        };
+      } catch (claimErr) {
+        transfer.state = "received";
+        extraMetadata.transfer_claimed = {
+          message_id: targetId,
+          amount: transfer.formattedAmount,
+          note: transfer.note,
+          update_error: String(claimErr),
+        };
+      }
     }
   }
 
-  // 解析引用回复的目标消息 ID 与被引原文
+  // 解析引用回复的目标消息 ID 与被引原文（兼容 MaiBot ReplyComponent 的 target_message_content）
   let replyToInfo: Record<string, unknown> | undefined;
   if (message.content?.type === "reply" && message.content?.target) {
     const targetId = String(message.content.target.id ?? "").trim();
@@ -1332,10 +1349,22 @@ async function handleInboundMessage(
       extractPlainTextFromContent(message.content.target.content) ||
       runtime.messageTextById.get(targetId) ||
       "";
+    const targetSenderId = String(
+      message.content.target.sender?.id ??
+      message.content.target.sender?.address ??
+      "",
+    ).trim();
+    const targetSenderName = String(
+      message.content.target.sender?.name ??
+      targetSenderId,
+    ).trim();
     if (targetId) {
       replyToInfo = {
         target_message_id: targetId,
+        target_message_content: targetText,
         text: targetText,
+        target_user_id: targetSenderId,
+        target_user_nickname: targetSenderName,
       };
     }
   }
@@ -1709,6 +1738,55 @@ function startNativeEventStreams(runtime: ProjectRuntime): void {
       })();
     } catch {
       // ignore
+    }
+
+    // 5) Find My Location Watch Stream
+    try {
+      const locService = (client as any).locations;
+      const watchFn =
+        typeof locService?.watch === "function"
+          ? () => locService.watch()
+          : typeof locService?.subscribeEvents === "function"
+            ? () => locService.subscribeEvents()
+            : null;
+      if (watchFn) {
+        const locStream = watchFn();
+        if (locStream && typeof locStream.close === "function") {
+          runtime.streamClosers.push(() => locStream.close().catch(() => {}));
+        }
+        (async () => {
+          try {
+            for await (const ev of locStream) {
+              const handle = String(
+                (ev as any)?.handle ??
+                (ev as any)?.address ??
+                (ev as any)?.sender?.address ??
+                "",
+              ).trim();
+              const chatGuid = String(
+                (ev as any)?.chatGuid ?? (handle ? `iMessage;-;${handle}` : ""),
+              );
+              sendNativeEventToPython(
+                runtime,
+                phone,
+                chatGuid,
+                handle,
+                "location.updated",
+                "location",
+                `location:${handle}:${(ev as any)?.timestamp ?? Date.now()}`,
+                {
+                  location: toJsonSafeMetadata(ev),
+                  handle,
+                },
+              );
+            }
+          } catch (err) {
+            console.debug("[sidecar] location 事件流已结束 (%s): %s", phone || runtime.projectId, String(err));
+          }
+        })();
+      }
+    } catch {
+      // ignore if location stream is unavailable
     }
   }
 }
@@ -2342,21 +2420,46 @@ async function dispatchAction(
   }
 
   if (action === "send_transfer_card" || action === "update_transfer_card") {
-    const photon = getManagedPhotonClient(runtime, space);
     const rawAmount = actionData.amount ?? "0";
     const currency = String(actionData.currency ?? "￥").trim() || "￥";
     const formattedAmount = formatTransferAmount(rawAmount, currency);
     const note = String(actionData.note ?? actionData.memo ?? "转账").trim();
     const appName = String(actionData.app_name ?? "转账").trim() || "转账";
-    const state: "pending" | "received" =
-      action === "update_transfer_card" || actionData.state === "received"
-        ? "received"
-        : "pending";
-    const stateLabel = state === "received" ? "已收款" : "待收款";
     const imageBytes = actionData.image_base64
       ? decodeOutboundAttachment(actionData.image_base64)
       : undefined;
 
+    if (action === "update_transfer_card" || actionData.state === "received") {
+      const targetMsgId = String(
+        actionData.target_message_id ??
+          actionData.message_id ??
+          [...runtime.transfersByMessageId.values()]
+            .reverse()
+            .find((t) => t.chatGuid === space.id && t.state === "pending")?.messageGuid ??
+          "",
+      ).trim();
+      const claimed = await claimOrUpdateTransferBubble(runtime, space, targetMsgId, {
+        amount: String(rawAmount),
+        currency,
+        note,
+        appName,
+        imageBytes,
+      });
+      return {
+        messageId: claimed.messageId,
+        actionMetadata: {
+          native: true,
+          media: "transfer_card",
+          amount: claimed.formattedAmount,
+          note: claimed.note,
+          state: "已收款",
+          original_message_id: targetMsgId,
+          original_retracted: claimed.originalRetracted,
+        },
+      };
+    }
+
+    const photon = getManagedPhotonClient(runtime, space);
     const sent = await photon.messages.sendCustomizedMiniApp(space.id, {
       appName,
       appStoreId: TRANSFER_APP_STORE_ID,
@@ -2366,9 +2469,9 @@ async function dispatchAction(
       layout: {
         caption: formattedAmount,
         ...(note ? { subcaption: note } : {}),
-        trailingCaption: stateLabel,
+        trailingCaption: "待收款",
         ...(imageBytes ? { image: imageBytes, imageTitle: appName } : {}),
-        summary: `转账 ${formattedAmount}${note ? ` · ${note}` : ""}（${stateLabel}）`,
+        summary: `转账 ${formattedAmount}${note ? ` · ${note}` : ""}（待收款）`,
       },
     });
     const messageId = rememberOutbound(runtime, { id: sent.guid, space }, space, formattedAmount) || sent.guid;
@@ -2380,7 +2483,7 @@ async function dispatchAction(
       note,
       currency,
       appName,
-      state,
+      state: "pending",
       createdAt: Date.now(),
     });
     return {
@@ -2390,7 +2493,7 @@ async function dispatchAction(
         media: "transfer_card",
         amount: formattedAmount,
         note,
-        state: stateLabel,
+        state: "待收款",
       },
     };
   }
@@ -2429,7 +2532,9 @@ async function dispatchAction(
     return {
       messageId: rememberOutbound(runtime, sent, space, url),
       actionMetadata: {
-        native: true,
+        native: false,
+        fallback: "apple_maps_richlink",
+        fallback_mode: true,
         media: "apple_maps_card",
         url,
         label,
@@ -2453,7 +2558,7 @@ async function dispatchAction(
     }));
     return {
       messageId: rememberOutbound(runtime, sent, space),
-      actionMetadata: { native: false, fallback: "static_image" },
+      actionMetadata: { native: false, fallback: "static_image", fallback_mode: true },
     };
   }
 
@@ -2481,9 +2586,16 @@ async function dispatchAction(
 
   if (action === "set_typing") {
     const isTyping = actionData.typing !== false && actionData.is_typing !== false;
-    const photon = getManagedPhotonClient(runtime, space);
-    await photon.chats.setTyping(space.id, isTyping);
-    return { actionMetadata: { native: true, action: "set_typing", is_typing: isTyping } };
+    const durationMs = Number(actionData.duration_ms ?? (isTyping ? 15000 : 0));
+    await setChatTypingWithLifecycle(runtime, space, isTyping, durationMs);
+    return {
+      actionMetadata: {
+        native: true,
+        action: "set_typing",
+        is_typing: isTyping,
+        duration_ms: isTyping ? durationMs : 0,
+      },
+    };
   }
 
   if (action === "mark_read") {
@@ -2542,6 +2654,7 @@ async function dispatchAction(
   if (action === "find_my_location") {
     const photon = getManagedPhotonClient(runtime, space);
     const operation = String(actionData.operation ?? "get").trim().toLowerCase();
+    const shouldRefresh = Boolean(actionData.refresh) || operation === "refresh";
     const peerAddress =
       String(actionData.address ?? "").trim() ||
       (space.id.includes(";-;") ? space.id.slice(space.id.indexOf(";-;") + 3).trim() : "");
@@ -2554,9 +2667,40 @@ async function dispatchAction(
       const receipt = await photon.locations.request(space.id, peerAddress);
       return { actionMetadata: { native: true, operation: "request", receipt: toJsonSafeMetadata(receipt) } };
     }
-    if (!peerAddress) throw new Error("find_my_location get 缺少目标 address");
+    let refreshed = false;
+    if (shouldRefresh && peerAddress) {
+      try {
+        if (typeof (photon.locations as any).refresh === "function") {
+          await (photon.locations as any).refresh(peerAddress);
+          refreshed = true;
+        } else if (typeof (photon.locations as any).request === "function") {
+          await photon.locations.request(space.id, peerAddress);
+          refreshed = true;
+        }
+      } catch (refreshErr) {
+        console.debug("[sidecar] Find My refresh 调用返回: %s", String(refreshErr));
+      }
+    }
+    if (!peerAddress) {
+      const list = await photon.locations.list();
+      return {
+        actionMetadata: {
+          native: true,
+          operation: shouldRefresh ? "refresh_list" : "list",
+          refreshed,
+          locations: toJsonSafeMetadata(list),
+        },
+      };
+    }
     const loc = await photon.locations.get(peerAddress);
-    return { actionMetadata: { native: true, operation: "get", location: toJsonSafeMetadata(loc) } };
+    return {
+      actionMetadata: {
+        native: true,
+        operation: shouldRefresh ? "refresh_get" : "get",
+        refreshed,
+        location: toJsonSafeMetadata(loc),
+      },
+    };
   }
 
   if (action === "open_dm") {
@@ -2611,8 +2755,8 @@ async function dispatchAction(
     } else if (action === "unvote_poll") {
       pollState = await photon.polls.unvote(pollMessageId);
     } else {
-      const title = String(actionData.title ?? actionData.option ?? "").trim();
-      if (!title) throw new Error("add_poll_option 缺少 title");
+      const title = String(actionData.title ?? actionData.option ?? actionData.option_text ?? "").trim();
+      if (!title) throw new Error("add_poll_option 缺少 title 或 option_text");
       pollState = await photon.polls.addOption(pollMessageId, title);
     }
     return {
@@ -2625,10 +2769,122 @@ async function dispatchAction(
     };
   }
 
-  if (action === "send_digital_touch") {
-    throw new Error("Digital Touch 当前没有已锁定的 spectrum-ts 公共发送 API");
-  }
   throw new Error(`未实现的 iMessage Action: ${action}`);
+}
+
+const activeTypingTimers = new Map<
+  string,
+  {
+    interval?: ReturnType<typeof setInterval>;
+    timeout?: ReturnType<typeof setTimeout>;
+  }
+>();
+
+async function setChatTypingWithLifecycle(
+  runtime: ProjectRuntime,
+  space: MessageSpace,
+  isTyping: boolean,
+  durationMs: number,
+): Promise<void> {
+  const key = `${runtime.projectId}:${space.id}`;
+  const existing = activeTypingTimers.get(key);
+  if (existing) {
+    if (existing.interval) clearInterval(existing.interval);
+    if (existing.timeout) clearTimeout(existing.timeout);
+    activeTypingTimers.delete(key);
+  }
+  const photon = getManagedPhotonClient(runtime, space);
+  await photon.chats.setTyping(space.id, isTyping);
+  if (!isTyping) {
+    return;
+  }
+  const boundedDuration = Math.min(Math.max(durationMs || 15000, 1500), 60000);
+  const interval = setInterval(() => {
+    photon.chats.setTyping(space.id, true).catch(() => {});
+  }, 4000);
+  const timeout = setTimeout(() => {
+    const timer = activeTypingTimers.get(key);
+    if (timer?.interval) clearInterval(timer.interval);
+    activeTypingTimers.delete(key);
+    photon.chats.setTyping(space.id, false).catch(() => {});
+  }, boundedDuration);
+  activeTypingTimers.set(key, { interval, timeout });
+}
+
+async function claimOrUpdateTransferBubble(
+  runtime: ProjectRuntime,
+  space: MessageSpace,
+  targetMessageId: string,
+  opts: {
+    amount?: string;
+    currency?: string;
+    note?: string;
+    appName?: string;
+    imageBytes?: Uint8Array;
+  },
+): Promise<{
+  messageId: string;
+  formattedAmount: string;
+  note: string;
+  originalRetracted: boolean;
+}> {
+  const existing = targetMessageId ? runtime.transfersByMessageId.get(targetMessageId) : undefined;
+  const rawAmount = opts.amount ?? existing?.amount ?? "0";
+  const currency = opts.currency ?? existing?.currency ?? "￥";
+  const formattedAmount = formatTransferAmount(rawAmount, currency);
+  const note = opts.note ?? existing?.note ?? "转账";
+  const appName = opts.appName ?? existing?.appName ?? "转账";
+  if (existing) {
+    existing.state = "received";
+  }
+
+  const photon = getManagedPhotonClient(runtime, space);
+  let originalRetracted = false;
+  if (targetMessageId) {
+    try {
+      await photon.messages.unsend(space.id, targetMessageId);
+      originalRetracted = true;
+    } catch {
+      try {
+        await photon.messages.edit(
+          space.id,
+          targetMessageId,
+          `[转账 ${formattedAmount}${note ? ` · ${note}` : ""} · ✓ 已收款]`,
+        );
+        originalRetracted = true;
+      } catch {
+        // ignore if message is older than edit/unsend window
+      }
+    }
+  }
+
+  const sent = await photon.messages.sendCustomizedMiniApp(space.id, {
+    appName,
+    appStoreId: TRANSFER_APP_STORE_ID,
+    extensionBundleId: TRANSFER_BUNDLE_ID,
+    teamId: TRANSFER_TEAM_ID,
+    url: TRANSFER_URL,
+    layout: {
+      caption: formattedAmount,
+      ...(note ? { subcaption: note } : {}),
+      trailingCaption: "✓ 已收款",
+      ...(opts.imageBytes ? { image: opts.imageBytes, imageTitle: appName } : {}),
+      summary: `转账 ${formattedAmount}${note ? ` · ${note}` : ""}（✓ 已收款）`,
+    },
+  });
+  const messageId = rememberOutbound(runtime, { id: sent.guid, space }, space, formattedAmount) || sent.guid;
+  runtime.transfersByMessageId.set(messageId, {
+    messageGuid: messageId,
+    chatGuid: space.id,
+    amount: String(rawAmount),
+    formattedAmount,
+    note,
+    currency,
+    appName,
+    state: "received",
+    createdAt: Date.now(),
+  });
+  return { messageId, formattedAmount, note, originalRetracted };
 }
 
 async function handleBridgeMessage(raw: WebSocket.RawData): Promise<void> {
@@ -2711,6 +2967,13 @@ async function handleBridgeMessage(raw: WebSocket.RawData): Promise<void> {
           action: "check_imessage_availability",
           address,
           imessage_available: available,
+          availability: {
+            available,
+            address,
+            services,
+            country,
+            focus_silenced: focusSilenced,
+          },
           services,
           country,
           focus_silenced: focusSilenced,
@@ -2720,14 +2983,17 @@ async function handleBridgeMessage(raw: WebSocket.RawData): Promise<void> {
     }
 
     if (actionData.action === "enroll_shared_user") {
-      const phone = String(actionData.phone_number ?? actionData.address ?? actionData.recipient ?? "").trim();
-      if (!phone) throw new Error("enroll_shared_user 缺少 phone_number");
-      const enrolled = await enrollPhotonSharedUser(runtime.projectId, runtime.projectSecret, phone);
+      const targetUser = String(
+        actionData.email ?? actionData.phone_number ?? actionData.address ?? actionData.recipient ?? "",
+      ).trim();
+      if (!targetUser) throw new Error("enroll_shared_user 缺少 email 或 phone_number");
+      const enrolled = await enrollPhotonSharedUser(runtime.projectId, runtime.projectSecret, targetUser);
       sendResult(true, "", {
         actionMetadata: {
           native: true,
           action: "enroll_shared_user",
-          phone_number: phone,
+          phone_number: targetUser,
+          imessage_alias: enrolled.assignedPhoneNumber,
           assigned_phone_number: enrolled.assignedPhoneNumber,
           user_id: enrolled.userId,
           already_enrolled: enrolled.alreadyEnrolled,
@@ -2754,6 +3020,11 @@ async function handleBridgeMessage(raw: WebSocket.RawData): Promise<void> {
       const resolved = await resolveSpace(runtime, targetId, linePhone);
       if (!resolved) throw new Error(`无法解析目标空间: ${targetId}`);
       space = resolved;
+    }
+
+    // 当 MaiBot 发送真实回复或执行其他出站操作时，立即结束当前会话的输入中 (Typing Indicator) 生命周期
+    if (actionData.action !== "set_typing") {
+      await setChatTypingWithLifecycle(runtime, space, false, 0).catch(() => {});
     }
 
     const result = await dispatchAction(runtime, space, actionData);

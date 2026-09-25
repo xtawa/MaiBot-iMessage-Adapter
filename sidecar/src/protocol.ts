@@ -2,7 +2,7 @@
 
 export const BRIDGE_PROTOCOL_VERSION = 3;
 
-export const STRUCTURED_ACTIONS = new Set([
+export const NATIVE_STRUCTURED_ACTIONS = new Set([
   "send",
   "send_reply",
   "edit_message",
@@ -16,7 +16,6 @@ export const STRUCTURED_ACTIONS = new Set([
   "vote_poll",
   "unvote_poll",
   "add_poll_option",
-  "send_location",
   "send_link_card",
   "send_music_card",
   "send_transfer_card",
@@ -24,8 +23,6 @@ export const STRUCTURED_ACTIONS = new Set([
   "send_vcard",
   "share_my_contact",
   "set_chat_background",
-  "send_handwriting",
-  "send_digital_touch",
   "place_sticker",
   "set_typing",
   "mark_read",
@@ -35,6 +32,16 @@ export const STRUCTURED_ACTIONS = new Set([
   "check_imessage_availability",
   "enroll_shared_user",
   "open_dm",
+]);
+
+export const FALLBACK_STRUCTURED_ACTIONS = new Set([
+  "send_location",
+  "send_handwriting",
+]);
+
+export const STRUCTURED_ACTIONS = new Set([
+  ...NATIVE_STRUCTURED_ACTIONS,
+  ...FALLBACK_STRUCTURED_ACTIONS,
 ]);
 
 const FUNCTION_FIELDS = new Set([
@@ -54,10 +61,17 @@ export function normalizeStructuredAction(value: unknown): StructuredAction {
   }
   const input = value as Record<string, unknown>;
   const action = typeof input.action === "string" ? input.action.trim().toLowerCase() : "";
+  if (action === "send_digital_touch") {
+    throw new Error("Digital Touch 出站发送未获 Photon/Spectrum SDK 公共接口支持（仅支持入站识别与内嵌图像提取）");
+  }
   if (!STRUCTURED_ACTIONS.has(action)) {
     throw new Error(`不支持的 iMessage Action: ${action || "<empty>"}`);
   }
-  return { ...input, action };
+  return {
+    ...input,
+    action,
+    ...(FALLBACK_STRUCTURED_ACTIONS.has(action) ? { fallback_mode: true } : {}),
+  };
 }
 
 /** Remove SDK methods and non-JSON values while retaining native metadata. */

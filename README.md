@@ -107,9 +107,11 @@ Photon免费的计划不支持电子邮件地址的iMessage !
 | `imessage_reply_or_edit_message` | 引用回复指定消息、编辑上一条已发消息、撤回已发消息或执行已读不回 |
 | `imessage_send_effect` | 发送带全屏特效（烟花、激光、气球、五彩纸屑、爱心、流星、聚光灯、回声、欢庆）、气泡特效（震撼、放大、缩小、隐形墨水）或 iOS 18 文字动效（抖动、点头、爆炸、波纹、绽放等）的消息 |
 | `imessage_poll` | 发起 iMessage 原生交互式投票、为现有投票投出一票、或向投票追加新选项 |
-| `imessage_send_card` | 发送音乐卡片（Apple Music / 网易云音乐双源检索）、虚拟转账收款卡片（对方双击点按气泡即可收款变灰）、富链接预览卡片或个人名片 |
-| `imessage_chat_and_group` | 管理 iMessage 群聊或会话（修改群名、拉人/踢人、展示输入中气泡、穿透勿扰模式强制提醒） |
-| `imessage_location_and_check` | 发送 Apple Maps 原生定位卡片、刷新/查询 Find My 实时位置、或检测号码是否支持 iMessage 蓝泡泡 |
+| `imessage_send_card` | 发送音乐卡片（Apple Music / 网易云音乐双源检索）、虚拟转账收款卡片（对方双击点按气泡即可收款，自动撤回/编辑原“待收款”气泡并替换为“✓ 已收款”）、富链接预览卡片或个人名片 |
+| `imessage_chat_and_group` | 管理 iMessage 群聊或会话（修改群名、拉人/踢人、展示带心跳与回复结束自动停止的输入中气泡、穿透勿扰模式强制提醒） |
+| `imessage_location_and_check` | 发送 Apple Maps 定位卡片（降级模式）、主动刷新并查询 Find My 实时位置、或检测号码是否支持 iMessage 蓝泡泡 |
+
+> **多会话并发防串台保护**：当存在多个并发活跃 iMessage 会话且调用 `@Tool` 未指定 `chat_id` 时，适配器会拒绝猜测全局最近会话并提示显式传入 `chat_id`（单活跃会话时可自动关联）。
 
 ### 内联动作标签（Inline Action Tags）
 
@@ -118,21 +120,21 @@ Photon免费的计划不支持电子邮件地址的iMessage !
 - `[text_effect:爆炸] 太离谱了！`（iOS 18 文字动效）
 - `[react:❤️]`（对最新入站消息发送 Tapback 反应）
 - `[music:周杰伦-晴天]`（自动检索 Apple Music / 网易云音乐并发送带封面的富链接音乐卡片）
-- `[transfer:520:拿去买奶茶]`（发送虚拟转账 MiniApp 卡片，用户点按气泡即可触发收款并自动更新卡片状态）
-- `[location:南宁万象城]` 或 `[location:22.8152,108.3669|万象城]`（发送 Apple Maps 定位卡片）
+- `[transfer:520:拿去买奶茶]`（发送虚拟转账 MiniApp 卡片，用户点按气泡即可触发收款，自动撤回/编辑原待收款气泡并替换为已收款卡片）
+- `[location:南宁万象城]` 或 `[location:22.8152,108.3669|万象城]`（发送 Apple Maps 定位预览卡片）
 - `[poll:今晚吃什么|火锅|烧烤|日料]` / `[vote:A]` / `[poll_add:小龙虾]`（发起投票 / 投票 / 加选项）
 - `[reply:我也觉得]` / `[edit:更正后的文本]` / `[unsend]` / `[leave_on_read]`
 
-### iMessage 能力与增强细节
+### iMessage 能力分类与 MaiBot 兼容细节（29 项原生动作 + 2 项降级动作）
 
-| 能力 | 适配行为 |
-|------|----------|
-| 文本、图片、视频、普通附件与文档提取 | 支持单条消息多段图文混排；自动嗅探图片/音视频魔数，并为 `.txt`/`.md`/`.json`/`.csv`/`.docx` 文档提取可读正文摘要注入 MaiBot |
-| 原生语音与 `+faststart` 转码 | 收到的 CAF/M4A 语音转为 `voice` 段；出站语音若系统存在 `ffmpeg` 会自动转码为带 `-movflags +faststart` 与精确时长的 M4A，防止 iOS 语音气泡显示 `0:00` 或消失 |
-| 底层 gRPC 实时事件流订阅 | 侧车除监听 `spectrum-ts` 消息外，还直接订阅底层 `AdvancedIMessage` 的 `messages`、`chats`、`polls`、`groups` 实时 gRPC 事件流，完整捕获入站撤回（含缓存原文回溯）、消息编辑（含修改前后对比）、已读回执、贴纸放置、聊天背景变更、投票选项追加及群成员/群名/群头像变更 |
-| 手写消息、Digital Touch 与 MiniApp 识别 | 入站消息自动调用 `photon.messages.getEmbeddedMedia` 提取 Apple 手写与 Digital Touch 内嵌图像，并解析 Apple Cash、Find My、网易云音乐、QQ 音乐、B 站、小红书等 15+ 种 iMessage 扩展气泡卡片 |
-| 投递状态二次核验 | 出站消息发送 12 秒后自动核验底层投递状态；若发现对方号码未开通 iMessage 或线路掉线会自动向日志与状态流告警 |
-| 附件流断线重试 | 针对 Photon gRPC 大附件下载偶发的 `RST_STREAM` / `CANCELLED` 瞬态异常内置 4 次指数退避重试 |
+| 类别 | 数量 / 范围 | 适配说明 |
+|------|-------------|----------|
+| **原生结构化动作 (`NATIVE_STRUCTURED_ACTIONS`)** | **29 项** | `send`、`open_dm`、`send_reply`、`send_reaction`、`remove_reaction`、`edit_message`、`unsend_message`、`send_effect`、`send_audio_message`、`send_sticker`、`place_sticker`、`send_live_photo`、`send_link_card`、`send_music_card`、`send_transfer_card`、`update_transfer_card`、`share_my_contact`、`send_contact_card`、`find_my_location`、`create_poll`、`vote_poll`、`add_poll_option`、`set_typing`、`mark_read`、`notify_silenced`、`set_chat_background`、`remove_chat_background`、`manage_group`、`check_imessage_availability`、`enroll_shared_user` |
+| **降级结构化动作 (`FALLBACK_STRUCTURED_ACTIONS`)** | **2 项** (`fallback_mode: true`) | `send_location`（通过 `https://maps.apple.com/` 富链接卡片 + Google Maps 静态预览图发送，非 CLLocation 原生数据包）、`send_handwriting`（服务端渲染手写笔迹 PNG 图片附件发送，回执中显式标记 `fallback_mode: true, native: false`） |
+| **仅支持入站解析的能力** | Digital Touch / 第三方扩展气泡 | 入站消息自动调用 `photon.messages.getEmbeddedMedia` 提取 Apple 手写与 Digital Touch 内嵌媒体，并解析 Apple Cash、Find My、网易云音乐、QQ 音乐、B 站、小红书等 15+ 种扩展气泡；**出站不支持 `send_digital_touch`**（调用时会显式报错拒绝） |
+| **MaiBot 标准消息段对齐** | `voice` / `file` / `reply` / `additional_config` | `voice` 段顶层提供 `binary_data_base64`（兼容 `PluginMessageUtils._build_binary_component`）；`file`/`video` 段在 `data` 内外均提供 `base64`（兼容 `FileComponent.from_payload`）；`reply` 段完整提供 `target_message_content`、`target_message_id`、`target_user_id`、`target_user_nickname`；原生事件无损保存在 `message_info.additional_config["imessage_event"]`，不向 `raw_message` 注入非标准段类型 |
+| **底层 gRPC 5 路实时事件流订阅** | `messages` / `chats` / `polls` / `groups` / `locations` | 侧车同时订阅 `AdvancedIMessage` 的 `messages`、`chats`、`polls`、`groups` 与 `locations.watch()` 实时流，完整捕获入站撤回（含缓存原文回溯）、消息编辑（含修改前后对比）、已读回执、贴纸放置、聊天背景变更、投票选项追加、群变更及 Find My 位置更新 (`location.updated`) |
+| **Typing 生命周期与投递核验** | 心跳保活 + 结束即停 + 12s 核验 | 收到消息后开启带 4s 心跳保活的 Typing Indicator，在 `send_to_imessage` 完成或报错时立即发送 `set_typing(false)` 关闭；出站 12 秒后自动核验底层投递状态；大附件下载内置 4 次指数退避重试 |
 
 ## 故障排查
 
