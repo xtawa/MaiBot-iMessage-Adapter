@@ -18,7 +18,7 @@
 
 ```
 cd /path/to/MaiBot/plugins
-git clone https://github.com/xtawa/MaiBot-iMessage-Adapter.git
+git clone https://github.com/mayan613/MaiBot-iMessage-Adapter.git
 ```
 
 ### 前置条件
