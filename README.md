@@ -82,12 +82,10 @@ platforms = ["imessage:+10000000000"] # 重要: 格式要求为 "imessage:+10000
 nickname = "麦麦" # 根据你的要求来改
 alias_names = [] 
 ```
+### 需要注意
 
-当然，如果你不喜欢直接编辑配置文件，也可以在WebUI中设置，具体方法是:`麦麦设置-基础-平台账号右边的加号-平台imessage,账号就是+10000000000` (请填写自己的项目信息)。
-不设置将无法正常发送信息。
-
-初次使用必须先通过iMessage向Photon平台提供的号码发送信息，否则因平台限制将会出现`AuthenticationError: [spectrum-imessage] Target not allowed for this project`错误。
-Photon免费的计划不支持电子邮件地址的iMessage !
+- **免费版 Photon 不支持电子邮件地址的 iMessage**，仅支持手机号
+- **免费版 Photon 不支持主动发起会话**，必须先自己通过 iMessage 向 Photon 号码发送首条消息后，才能回复
 
 ### 管理命令
 
@@ -108,7 +106,7 @@ Photon免费的计划不支持电子邮件地址的iMessage !
 | `imessage_reply_or_edit_message` | 引用回复指定消息、编辑上一条已发消息、撤回已发消息或执行已读不回 |
 | `imessage_send_effect` | 发送带全屏特效（烟花、激光、气球、五彩纸屑、爱心、流星、聚光灯、回声、欢庆）、气泡特效（震撼、放大、缩小、隐形墨水）或 iOS 18 文字动效（抖动、点头、爆炸、波纹、绽放等）的消息 |
 | `imessage_poll` | 发起 iMessage 原生交互式投票、为现有投票投出一票、或向投票追加新选项 |
-| `imessage_send_card` | 发送音乐卡片（Apple Music / 网易云音乐双源检索）、虚拟转账收款卡片（对方双击点按气泡即可收款，自动撤回/编辑原“待收款”气泡并替换为“✓ 已收款”）、富链接预览卡片或个人名片 |
+| `imessage_send_card` | 发送音乐卡片（Apple Music / 网易云音乐双源检索）、富链接预览卡片或个人名片 |
 | `imessage_chat_and_group` | 管理 iMessage 群聊或会话（修改群名、拉人/踢人、展示带心跳与回复结束自动停止的输入中气泡、穿透勿扰模式强制提醒） |
 | `imessage_location_and_check` | 发送 Apple Maps 定位卡片（降级模式）、主动刷新并查询 Find My 实时位置、或检测号码是否支持 iMessage 蓝泡泡 |
 
